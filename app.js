@@ -77,14 +77,39 @@ const SN = {
 };
 const sn = c => SN[c] || `Subj ${c}`;
 
-/* ── STATE ── */
+
 const raw = {X:null, XII:null};
-const DB  = {X:[],   XII:[]};
+const DB = {X:[], XII:[]};
+const parseDiagnostics = {X:null, XII:null};
+
 let charts = {};
 let activeCls = null;
 let activeSec = 'summary';
+let overlayState = null;
 
-/* ── UPLOAD ── */
+/*
+ * Shared student record contract used by renderers and exports:
+ * { rollNo, gender, name, result, cls, compSub, subjects }
+ * subjects: [{ code, name, marks, grade }]
+ */
+function createStudentRecord({rollNo, gender, name, result, cls, compSub, subjects}){
+  return {rollNo, gender, name, result, cls, compSub, subjects};
+}
+
+function createParseDiagnostics(cls){
+  return {cls, matchedRows:0, parsedStudents:0, warnings:[]};
+}
+
+function addParseWarning(diagnostics, detail){
+  diagnostics.warnings.push(detail);
+}
+
+function resetCardState(cls){
+  raw[cls] = null;
+  document.getElementById('card-'+cls).className = 'upload-card';
+  document.getElementById('status-'+cls).textContent = '';
+}
+
 function dragOver(e,c){e.preventDefault();document.getElementById('card-'+c).classList.add('dragover')}
 function dragLeave(e,c){document.getElementById('card-'+c).classList.remove('dragover')}
 function fileDrop(e,c){e.preventDefault();dragLeave(e,c);readFile(e.dataTransfer.files[0],c)}
@@ -103,17 +128,11 @@ function readFile(file, c){
   r.onload = ev => {
     const text = ev.target.result;
     const detected = detectClass(text);
-    // If file dropped on wrong card, silently re-route to correct class
     const actualClass = detected || c;
-    // Clear the other slot if we're re-routing (avoid stale data)
-    if(detected && detected !== c){
-      raw[c] = null;
-      document.getElementById('card-'+c).className = 'upload-card';
-      document.getElementById('status-'+c).textContent = '';
-    }
+    if(detected && detected !== c) resetCardState(c);
     raw[actualClass] = text;
     const el = document.getElementById('status-'+actualClass);
-    el.textContent = '✓ ' + file.name + (detected && detected !== c ? '  (auto-detected as Class '+detected+')' : '');
+    el.textContent = 'Loaded ' + file.name + (detected && detected !== c ? ' (auto-detected as Class '+detected+')' : '');
     el.style.color = actualClass==='X' ? 'var(--cx-dk)' : 'var(--cxii-dk)';
     document.getElementById('card-'+actualClass).className = 'upload-card loaded-'+actualClass;
     document.getElementById('btn-analyze').disabled = !(raw.X || raw.XII);
@@ -121,78 +140,192 @@ function readFile(file, c){
   r.readAsText(file,'UTF-8');
 }
 
-/* ── PARSERS ── */
 function normalize(t){ return t.replace(/\r\n/g,'\n').replace(/\r/g,'\n'); }
 
+function buildSubs(codes, toks, result, diagnostics, rollNo){
+  if(result==='ABST' && toks.length===0){
+    return codes.map(c=>({code:c, name:sn(c), marks:0, grade:'AB'}));
+  }
+
+  if(toks.length===0){
+    addParseWarning(diagnostics, `Roll ${rollNo}: marks line missing or unreadable.`);
+  } else if(toks.length !== codes.length){
+    addParseWarning(diagnostics, `Roll ${rollNo}: expected ${codes.length} subjects, found ${toks.length} mark entries.`);
+  }
+
+  const usable = Math.min(codes.length, toks.length);
+  return codes.slice(0, usable).map((c,j)=>({
+    code:c,
+    name:sn(c),
+    marks:toks[j][1] === 'AB' ? 0 : parseInt(toks[j][1], 10),
+    grade:toks[j][1] === 'AB' ? 'AB' : toks[j][2]
+  }));
+}
+
 function parseX(text){
-  const lines = normalize(text).split('\n'), out = [];
+  const lines = normalize(text).split('\n');
+  const out = [];
+  const diagnostics = createParseDiagnostics('X');
+
   for(let i=0;i<lines.length;i++){
     const ln = lines[i];
     const m = ln.match(/^(\d{8})\s+(F|M)\s+(.+?)\s{2,}((?:\d{3}\s+){4,6}\d{3})\s+(PASS|COMP|ABST|FAIL)/);
     if(!m) continue;
+
+    diagnostics.matchedRows++;
     const codes = m[4].trim().split(/\s+/);
     const cm = ln.match(/COMP\s+(\d{3})/);
-    const toks = [...(lines[i+1]||'').matchAll(/(\d{2,3})\s+(A1|A2|B1|B2|C1|C2|D1|D2|E)\b/g)];
-    out.push({rollNo:m[1],gender:m[2],name:m[3].trim(),result:m[5],cls:'X',
-      compSub:cm?cm[1]:null, subjects:buildSubs(codes,toks,m[5])});
+    const nextLine = lines[i+1] || '';
+    const toks = [...nextLine.matchAll(/(AB|\d{2,3})\s+(A1|A2|B1|B2|C1|C2|D1|D2|E)\b/g)];
+    const subjects = buildSubs(codes, toks, m[5], diagnostics, m[1]);
+
+    if(!subjects.length && m[5] !== 'ABST'){
+      addParseWarning(diagnostics, `Roll ${m[1]}: no subject marks were parsed from the detail line.`);
+    }
+
+    out.push(createStudentRecord({
+      rollNo:m[1],
+      gender:m[2],
+      name:m[3].trim(),
+      result:m[5],
+      cls:'X',
+      compSub:cm ? cm[1] : null,
+      subjects
+    }));
+    diagnostics.parsedStudents++;
     i++;
   }
-  return out;
+
+  return {students:out, diagnostics};
 }
 
 function parseXII(text){
-  const lines = normalize(text).split('\n'), out = [];
+  const lines = normalize(text).split('\n');
+  const out = [];
+  const diagnostics = createParseDiagnostics('XII');
+
   for(let i=0;i<lines.length;i++){
     const ln = lines[i];
     let m = ln.match(/^(\d{8})\s+(F|M)\s+(.+?)\s{2,}((?:\d{3}\s+){4,6}\d{3})\s+(?:A1|A2|B1|B2|C1|C2|D1|D2|E)\s+(?:A1|A2|B1|B2|C1|C2|D1|D2|E)\s+(?:A1|A2|B1|B2|C1|C2|D1|D2|E)\s+(PASS|COMP|ABST|FAIL)/);
     if(!m) m = ln.match(/^(\d{8})\s+(F|M)\s+(.+?)\s{2,}((?:\d{3}\s+){4,6}\d{3})\s+.{0,50}?(ABST|PASS|COMP|FAIL)\b/);
     if(!m) continue;
+
+    diagnostics.matchedRows++;
     const codes = m[4].trim().split(/\s+/);
     const cm = ln.match(/COMP\s+((?:\d{3}[ \t]*)+)/);
-    const toks = [...(lines[i+1]||'').matchAll(/(\d{2,3})\s+(A1|A2|B1|B2|C1|C2|D1|D2|E)\b/g)];
-    out.push({rollNo:m[1],gender:m[2],name:m[3].trim(),result:m[5],cls:'XII',
-      compSub:cm?cm[1].trim():null, subjects:buildSubs(codes,toks,m[5])});
+    const nextLine = lines[i+1] || '';
+    const toks = [...nextLine.matchAll(/(AB|\d{2,3})\s+(A1|A2|B1|B2|C1|C2|D1|D2|E)\b/g)];
+    const subjects = buildSubs(codes, toks, m[5], diagnostics, m[1]);
+
+    if(!subjects.length && m[5] !== 'ABST'){
+      addParseWarning(diagnostics, `Roll ${m[1]}: no subject marks were parsed from the detail line.`);
+    }
+
+    out.push(createStudentRecord({
+      rollNo:m[1],
+      gender:m[2],
+      name:m[3].trim(),
+      result:m[5],
+      cls:'XII',
+      compSub:cm ? cm[1].trim() : null,
+      subjects
+    }));
+    diagnostics.parsedStudents++;
     i++;
   }
-  return out;
+
+  return {students:out, diagnostics};
 }
 
-function buildSubs(codes, toks, result){
-  if(result==='ABST' && toks.length===0)
-    return codes.map(c=>({code:c,name:sn(c),marks:0,grade:'AB'}));
-  return codes.slice(0,toks.length).map((c,j)=>({
-    code:c, name:sn(c), marks:parseInt(toks[j][1]), grade:toks[j][2]
-  }));
+function parseMeta(t) {
+  const yr = t.match(/EXAMINATION[^-\n]*[-\u2013](\d{4})/);
+  const rg = t.match(/REGION\s*:\s*([A-Z][A-Z0-9 ]+?)(?:\s{2,}|\n|PAGE)/i);
+  const sc = t.match(/SCHOOL\s*:\s*-\s*(\d+)\s+(.+)/i);
+  return {
+    year: yr ? yr[1] : new Date().getFullYear(),
+    region: rg ? rg[1].trim() : '',
+    code: sc ? sc[1].trim() : '',
+    school: sc ? sc[2].trim() : '',
+  };
 }
 
-/* ── RUN ── */
+function renderParseWarnings(){
+  const banner = document.getElementById('parse-banner');
+  const body = document.getElementById('parse-banner-body');
+  const classes = ['X', 'XII'].map(cls => parseDiagnostics[cls]).filter(diag => diag && diag.warnings.length);
+
+  if(!classes.length){
+    banner.classList.remove('show');
+    body.innerHTML = '';
+    return;
+  }
+
+  body.innerHTML = classes.map(diag => {
+    const grouped = {};
+    diag.warnings.forEach(msg => { grouped[msg] = (grouped[msg] || 0) + 1; });
+    const items = Object.entries(grouped);
+    const preview = items.slice(0, 4).map(([msg, count]) =>
+      `<li>${msg}${count > 1 ? ` (${count} rows)` : ''}</li>`
+    ).join('');
+    const more = items.length > 4 ? `<div class="parse-warning-more">${items.length - 4} more warning pattern(s) not shown.</div>` : '';
+
+    return `
+      <div style="margin-bottom:10px">
+        <div class="parse-summary">
+          <span class="parse-chip">Class ${diag.cls}</span>
+          <span class="parse-chip">${diag.parsedStudents} students parsed</span>
+          <span class="parse-chip">${diag.warnings.length} warnings</span>
+        </div>
+        <ul class="parse-warning-list">${preview}</ul>
+        ${more}
+      </div>`;
+  }).join('');
+
+  banner.classList.add('show');
+}
+
 function runAnalysis(){
-  if(raw.X)   DB.X   = parseX(raw.X);
-  if(raw.XII) DB.XII = parseXII(raw.XII);
+  parseDiagnostics.X = null;
+  parseDiagnostics.XII = null;
+  DB.X = [];
+  DB.XII = [];
+
+  if(raw.X){
+    const parsedX = parseX(raw.X);
+    DB.X = parsedX.students;
+    parseDiagnostics.X = parsedX.diagnostics;
+  }
+  if(raw.XII){
+    const parsedXII = parseXII(raw.XII);
+    DB.XII = parsedXII.students;
+    parseDiagnostics.XII = parsedXII.diagnostics;
+  }
+
   const tot = DB.X.length + DB.XII.length;
-  if(!tot){alert('Could not parse any student records. Please check the file format.');return;}
+  if(!tot){
+    renderParseWarnings();
+    alert('Could not parse any student records. Please check the file format.');
+    return;
+  }
 
   document.getElementById('upload-screen').style.display = 'none';
   document.getElementById('dashboard').style.display = 'block';
   document.getElementById('btn-export').style.display = 'inline-block';
 
   const meta = parseMeta(raw.X || raw.XII || '');
-  // Dynamic school name in header subtitle
   if(meta.school) document.getElementById('hschool').textContent = meta.school;
 
   document.getElementById('hmeta').innerHTML =
-    [DB.X.length   ? `Class X: <strong style="color:var(--gold)">${DB.X.length}</strong>` : '',
+    [DB.X.length ? `Class X: <strong style="color:var(--gold)">${DB.X.length}</strong>` : '',
      DB.XII.length ? `Class XII: <strong style="color:#22d3ee">${DB.XII.length}</strong>` : '']
-    .filter(Boolean).join(' &nbsp;·&nbsp; ') +
+      .filter(Boolean).join(' &nbsp;&middot;&nbsp; ') +
     `<br><span style="opacity:.6">CBSE ${meta.year}` +
-    (meta.code   ? ` &nbsp;·&nbsp; School ${meta.code}` : '') +
-    (meta.region ? ` &nbsp;·&nbsp; ${meta.region}` : '') + `</span>`;
+    (meta.code ? ` &nbsp;&middot;&nbsp; School ${meta.code}` : '') +
+    (meta.region ? ` &nbsp;&middot;&nbsp; ${meta.region}` : '') + `</span>`;
 
+  renderParseWarnings();
   buildClassTabs();
-  const first = DB.X.length ? 'X' : 'XII';
-  switchClass(first);
-
-  // Save to localStorage after successful analysis
+  switchClass(DB.X.length ? 'X' : 'XII');
   saveToLocalStorage();
 }
 
@@ -203,13 +336,11 @@ function saveToLocalStorage(){
   ['X','XII'].forEach(c=>{
     if(raw[c]) localStorage.setItem(`${code}-${year}-${c}`, raw[c]);
   });
-  // Show clear button and backup button
   document.getElementById('btn-clear').style.display = 'inline-block';
   document.getElementById('btn-backup').style.display = 'inline-block';
 }
 
 function clearSavedData(){
-  // Remove keys for this session
   const meta = parseMeta(raw.X || raw.XII || '');
   const code = meta.code || 'CBSE';
   const year = meta.year || new Date().getFullYear();
@@ -217,22 +348,31 @@ function clearSavedData(){
   location.reload();
 }
 
-/* ── BACKUP EXPORT ── */
-function exportBackup(){
+function collectSavedSessions(){
   const pattern = /^(.+)-(\d{4})-(X|XII)$/;
-  // Collect ALL sessions currently in localStorage
   const sessionsMap = {};
   for(let i=0;i<localStorage.length;i++){
-    const k = localStorage.key(i);
-    const m = k && k.match(pattern);
-    if(!m) continue;
-    const [,code,year,cls] = m;
-    const key = `${code}-${year}`;
-    if(!sessionsMap[key]) sessionsMap[key] = {code, year, classes:{}};
-    sessionsMap[key].classes[cls] = localStorage.getItem(k);
+    const key = localStorage.key(i);
+    const match = key && key.match(pattern);
+    if(!match) continue;
+    const [, code, year, cls] = match;
+    const sessionKey = `${code}-${year}`;
+    if(!sessionsMap[sessionKey]) sessionsMap[sessionKey] = {schoolCode:code, year, classes:{}};
+    sessionsMap[sessionKey].classes[cls] = localStorage.getItem(key);
   }
-  if(!Object.keys(sessionsMap).length){
-    alert('No saved data found to back up. Please analyse results first.'); return;
+
+  return Object.values(sessionsMap).sort((a,b)=>{
+    const yearDiff = String(b.year).localeCompare(String(a.year));
+    if(yearDiff) return yearDiff;
+    return String(a.schoolCode).localeCompare(String(b.schoolCode));
+  });
+}
+
+function exportBackup(){
+  const sessions = collectSavedSessions();
+  if(!sessions.length){
+    alert('No saved data found to back up. Please analyse results first.');
+    return;
   }
 
   const meta = parseMeta(raw.X || raw.XII || '');
@@ -240,84 +380,91 @@ function exportBackup(){
     version: 1,
     exportedAt: new Date().toISOString(),
     generator: 'CBSE Result Dashboard',
-    sessions: Object.values(sessionsMap).map(s=>({
-      schoolCode: s.code,
-      year: s.year,
-      classes: s.classes
-    }))
+    sessions
   };
 
   const blob = new Blob([JSON.stringify(backup, null, 2)], {type:'application/json'});
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href     = url;
-  const school = (meta.school||meta.code||'CBSE').replace(/\s+/g,'_').substring(0,20);
-  a.download = `CBSE_Backup_${school}_${meta.year||''}.json`;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const school = (meta.school || meta.code || 'CBSE').replace(/\s+/g,'_').substring(0,20);
+  a.download = `CBSE_Backup_${school}_${meta.year || ''}.json`;
   a.click();
   URL.revokeObjectURL(url);
 }
 
-/* ── BACKUP IMPORT ── */
-let _pendingImport = null; // holds parsed backup data while overlay is open
-
-function handleImportFile(e){
-  const file = e.target.files[0];
-  if(!file) return;
-  // Reset input so same file can be re-selected if needed
-  e.target.value = '';
-  const r = new FileReader();
-  r.onload = ev => {
-    let data;
-    try { data = JSON.parse(ev.target.result); }
-    catch{ alert('Invalid backup file — could not parse JSON.'); return; }
-
-    if(!data.version || !Array.isArray(data.sessions) || !data.sessions.length){
-      alert('Invalid backup file — missing sessions data.'); return;
-    }
-    _pendingImport = data;
-    openImportOverlay(data);
-  };
-  r.readAsText(file,'UTF-8');
+function getSessionMeta(session){
+  return parseMeta(Object.values(session.classes)[0] || '');
 }
 
-function openImportOverlay(data){
+function openSessionOverlay(config){
+  overlayState = config;
   const overlay = document.getElementById('import-overlay');
   const container = document.getElementById('import-sessions');
   const loadBtn = document.getElementById('import-btn-load');
+  document.getElementById('import-title').textContent = config.title;
+  document.getElementById('import-desc').textContent = config.description;
+  loadBtn.textContent = config.buttonLabel || 'Load Selected';
   loadBtn.disabled = true;
 
-  // Build session cards
-  container.innerHTML = data.sessions.map((s,i)=>{
-    const clsList = Object.keys(s.classes);
-    const meta = parseMeta(Object.values(s.classes)[0] || '');
-    const schoolName = meta.school || s.schoolCode;
-    const classBadges = clsList.map(c=>
-      `<span style="font-size:11px;font-weight:700;padding:2px 8px;border-radius:20px;
-        background:${c==='X'?'var(--cx-lt)':'var(--cxii-lt)'};
-        color:${c==='X'?'var(--cx-dk)':'var(--cxii-dk)'}">Class ${c}</span>`
+  container.innerHTML = config.sessions.map((session, i) => {
+    const clsList = Object.keys(session.classes);
+    const meta = getSessionMeta(session);
+    const schoolName = meta.school || session.schoolCode;
+    const classBadges = clsList.map(c =>
+      `<span style="font-size:11px;font-weight:700;padding:2px 8px;border-radius:20px;background:${c==='X'?'var(--cx-lt)':'var(--cxii-lt)'};color:${c==='X'?'var(--cx-dk)':'var(--cxii-dk)'}">Class ${c}</span>`
     ).join('');
     return `<div class="import-session" data-idx="${i}" onclick="selectImportSession(this)">
-      <div style="font-size:28px">🏫</div>
+      <div style="font-size:16px;font-weight:800;font-family:'DM Mono',monospace">${i + 1}</div>
       <div class="import-session-info">
         <div class="import-session-name">${schoolName}</div>
-        <div class="import-session-meta">School ${s.schoolCode} &nbsp;·&nbsp; ${s.year}</div>
+        <div class="import-session-meta">School ${session.schoolCode} &nbsp;&middot;&nbsp; ${session.year}</div>
         <div class="import-session-cls">${classBadges}</div>
       </div>
     </div>`;
   }).join('');
 
-  // Auto-select if only one session
-  if(data.sessions.length === 1){
+  if(config.sessions.length === 1){
     const card = container.querySelector('.import-session');
-    if(card){ card.classList.add('selected'); loadBtn.disabled = false; }
+    if(card){
+      card.classList.add('selected');
+      loadBtn.disabled = false;
+    }
   }
 
-  const d = new Date(data.exportedAt);
-  const dateStr = isNaN(d) ? '' : ` · Backed up ${d.toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}`;
-  document.getElementById('import-desc').textContent =
-    `${data.sessions.length} session${data.sessions.length>1?'s':''} found in this backup${dateStr}. Select one to load.`;
-
   overlay.classList.add('show');
+}
+
+function handleImportFile(e){
+  const file = e.target.files[0];
+  if(!file) return;
+  e.target.value = '';
+  const r = new FileReader();
+  r.onload = ev => {
+    let data;
+    try {
+      data = JSON.parse(ev.target.result);
+    } catch {
+      alert('Invalid backup file - could not parse JSON.');
+      return;
+    }
+
+    if(!data.version || !Array.isArray(data.sessions) || !data.sessions.length){
+      alert('Invalid backup file - missing sessions data.');
+      return;
+    }
+
+    const exportedAt = new Date(data.exportedAt);
+    const dateText = isNaN(exportedAt) ? '' : ` Backed up ${exportedAt.toLocaleDateString('en-IN', {day:'numeric', month:'short', year:'numeric'})}.`;
+    openSessionOverlay({
+      mode:'backup',
+      sessions:data.sessions,
+      title:'Restore from Backup',
+      description:`${data.sessions.length} session${data.sessions.length > 1 ? 's' : ''} found in this backup.${dateText} Select one to load.`,
+      buttonLabel:'Load Selected'
+    });
+  };
+  r.readAsText(file,'UTF-8');
 }
 
 function selectImportSession(el){
@@ -328,71 +475,68 @@ function selectImportSession(el){
 
 function closeImportOverlay(){
   document.getElementById('import-overlay').classList.remove('show');
-  _pendingImport = null;
+  overlayState = null;
 }
 
-function doImport(){
-  if(!_pendingImport) return;
-  const selected = document.querySelector('.import-session.selected');
-  if(!selected){ alert('Please select a session to load.'); return; }
-  const idx = parseInt(selected.dataset.idx);
-  const session = _pendingImport.sessions[idx];
-  if(!session){ alert('Session data not found.'); return; }
-
-  // Write to localStorage
-  Object.entries(session.classes).forEach(([cls, text])=>{
-    localStorage.setItem(`${session.schoolCode}-${session.year}-${cls}`, text);
-  });
-
-  closeImportOverlay();
-  // Reload to trigger tryRestoreFromLocalStorage
-  location.reload();
-}
-
-function tryRestoreFromLocalStorage(){
-  // Find any keys matching pattern: {code}-{year}-{X|XII}
-  const pattern = /^(.+)-(\d{4})-(X|XII)$/;
-  const found = {};
-  for(let i=0;i<localStorage.length;i++){
-    const k = localStorage.key(i);
-    const m = k && k.match(pattern);
-    if(m) found[m[3]] = {key:k, code:m[1], year:m[2], text:localStorage.getItem(k)};
-  }
-  if(!Object.keys(found).length) return;
-
-  // Restore raw data for each class found
-  let code='', year='';
-  if(found.X)   { raw.X   = found.X.text;   code=found.X.code;   year=found.X.year; }
-  if(found.XII) { raw.XII = found.XII.text;  code=found.XII.code; year=found.XII.year; }
-
-  // Show restore banner
+function showRestoreBanner(message){
   const banner = document.getElementById('restore-banner');
-  const msg    = document.getElementById('restore-msg');
-  msg.textContent = `✓ Data restored from saved session — School ${code} · ${year}`;
+  document.getElementById('restore-msg').textContent = message;
   banner.classList.add('show');
+}
 
-  // Show backup button since we have saved data
-  document.getElementById('btn-backup').style.display = 'inline-block';
-
-  // Auto-analyse
+function restoreSession(session, source){
+  raw.X = session.classes.X || null;
+  raw.XII = session.classes.XII || null;
+  showRestoreBanner(`${source} - School ${session.schoolCode} | ${session.year}`);
   runAnalysis();
 }
 
-function parseMeta(t) {
-  // Year — from exam title e.g. "EXAMINATION (MAIN)-2025"
-  const yr = t.match(/EXAMINATION[^-\n]*[-\u2013](\d{4})/);
-  // Region — e.g. "REGION: NOIDA"
-  const rg = t.match(/REGION\s*:\s*([A-Z][A-Z0-9 ]+?)(?:\s{2,}|\n|PAGE)/i);
-  // School code + name — e.g. "SCHOOL : - 60478   SUDITI GLOBAL ACADEMY..."
-  const sc = t.match(/SCHOOL\s*:\s*-\s*(\d+)\s+(.+)/i);
-  return {
-    year:   yr ? yr[1] : new Date().getFullYear(),
-    region: rg ? rg[1].trim() : '',
-    code:   sc ? sc[1].trim() : '',
-    school: sc ? sc[2].trim() : '',
-  };
+function doImport(){
+  if(!overlayState) return;
+  const selected = document.querySelector('.import-session.selected');
+  if(!selected){
+    alert('Please select a session to load.');
+    return;
+  }
+
+  const idx = parseInt(selected.dataset.idx, 10);
+  const session = overlayState.sessions[idx];
+  if(!session){
+    alert('Session data not found.');
+    return;
+  }
+
+  if(overlayState.mode === 'backup'){
+    Object.entries(session.classes).forEach(([cls, text]) => {
+      localStorage.setItem(`${session.schoolCode}-${session.year}-${cls}`, text);
+    });
+    closeImportOverlay();
+    restoreSession(session, 'Data restored from backup');
+    return;
+  }
+
+  closeImportOverlay();
+  restoreSession(session, 'Data restored from saved session');
 }
 
+function tryRestoreFromLocalStorage(){
+  const sessions = collectSavedSessions();
+  if(!sessions.length) return;
+
+  if(sessions.length === 1){
+    restoreSession(sessions[0], 'Data restored from saved session');
+    return;
+  }
+
+  openSessionOverlay({
+    mode:'saved',
+    sessions,
+    title:'Choose Saved Session',
+    description:`${sessions.length} saved sessions were found in this browser. Select one to restore.`,
+    buttonLabel:'Restore Selected'
+  });
+  document.getElementById('btn-backup').style.display = 'inline-block';
+}
 /* ── CLASS TABS ── */
 function buildClassTabs(){
   const bar = document.getElementById('class-tabs');
@@ -899,10 +1043,15 @@ function drawMerit(cls){
 
   if(cf!=='all') pool = pool.slice(0, parseInt(cf));
 
-  // Assign ranks (shared rank for tied students; next rank = position after the group)
+  // Dense ranking: ties share rank, next distinct score gets the next consecutive rank.
+  let currentRank = 0;
   pool.forEach((s,i)=>{
-    if(i>0 && Math.abs(s._pct-pool[i-1]._pct)<0.001) s._rank=pool[i-1]._rank;
-    else s._rank = i+1;
+    if(i>0 && Math.abs(s._pct-pool[i-1]._pct)<0.001){
+      s._rank = pool[i-1]._rank;
+    } else {
+      currentRank += 1;
+      s._rank = currentRank;
+    }
   });
 
   const resBadge = r => r==='COMP'
