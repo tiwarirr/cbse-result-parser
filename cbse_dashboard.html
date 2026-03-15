@@ -21,6 +21,7 @@
   </div>
   <div class="hright">
     <div class="hmeta" id="hmeta">Upload result files to begin</div>
+    <button class="btn-restore-json" id="btn-add-school" onclick="showUploadScreen()" style="display:none">Add School</button>
     <button class="btn-backup" id="btn-backup" onclick="exportBackup()" style="display:none">Backup</button>
     <button class="btn-restore-json" id="btn-restore-json" onclick="document.getElementById('import-file-input').click()">Restore Backup</button>
     <input type="file" id="import-file-input" accept=".json" style="display:none" onchange="handleImportFile(event)">
@@ -53,6 +54,13 @@
   </div>
 </div>
 
+<div class="mixed-year-banner" id="mixed-year-banner">
+  <div class="parse-banner-inner">
+    <div class="parse-banner-title">Mixed Year Comparison</div>
+    <div class="parse-banner-body">Selected schools belong to multiple exam years. Merit and comparison results may be less comparable.</div>
+  </div>
+</div>
+
 <div id="upload-screen">
   <div class="upload-hero">
     <h1>CBSE Gazette<br><em style="color:var(--gold-dk)">Result Analyser</em></h1>
@@ -78,10 +86,74 @@
       <div class="upload-status" id="status-XII"></div>
     </div>
   </div>
-  <button class="btn-analyze" id="btn-analyze" onclick="runAnalysis()" disabled>Analyse Results</button>
+  <div class="upload-actions">
+    <button class="btn-analyze" id="btn-analyze" onclick="runAnalysis()" disabled>Analyse Results</button>
+    <button class="btn-clear upload-cancel" id="btn-upload-cancel" onclick="hideUploadScreen()" style="display:none">Cancel</button>
+  </div>
 </div>
 
 <div id="dashboard">
+  <div class="workspace-panel">
+    <div class="workspace-top">
+      <div>
+        <div class="workspace-title">Multischool Workspace</div>
+        <div class="workspace-sub" id="workspace-sub">Upload or restore schools to start a multischool workspace.</div>
+        <div class="storage-indicator" id="storage-indicator">
+          <div class="storage-label-row">
+            <span class="storage-label">Local Storage</span>
+            <span class="storage-value" id="storage-value">Checking...</span>
+          </div>
+          <div class="storage-bar">
+            <div class="storage-fill" id="storage-fill"></div>
+          </div>
+        </div>
+      </div>
+      <div class="workspace-actions">
+        <button class="btn-export workspace-btn" onclick="promptSaveCombination()" style="display:inline-block">Save Combination</button>
+      </div>
+    </div>
+    <div class="workspace-filters">
+      <div class="workspace-field">
+        <label for="workspace-mode">View Mode</label>
+        <select id="workspace-mode" class="sselect" onchange="onWorkspaceModeChange()">
+          <option value="single">Single School</option>
+          <option value="multi">Multi-School</option>
+        </select>
+      </div>
+      <div class="workspace-field">
+        <label for="compare-year">Year</label>
+        <select id="compare-year" class="sselect" onchange="onWorkspaceFilterChange()">
+          <option value="all">All Years</option>
+        </select>
+      </div>
+      <div class="workspace-field">
+        <label for="compare-class">Class Scope</label>
+        <select id="compare-class" class="sselect" onchange="onWorkspaceFilterChange()">
+          <option value="X">Class X</option>
+          <option value="XII">Class XII</option>
+          <option value="all">All Classes</option>
+        </select>
+      </div>
+      <div class="workspace-field">
+        <label for="compare-merit-scope">Merit Scope</label>
+        <select id="compare-merit-scope" class="sselect" onchange="onWorkspaceFilterChange()">
+          <option value="same-class">Same Class</option>
+          <option value="all-classes">All Classes</option>
+        </select>
+      </div>
+    </div>
+    <div class="workspace-grid">
+      <div class="workspace-block">
+        <div class="workspace-block-title">Schools</div>
+        <div id="session-list" class="workspace-list"></div>
+      </div>
+      <div class="workspace-block">
+        <div class="workspace-block-title">Saved Combinations</div>
+        <div id="combination-list" class="workspace-list"></div>
+      </div>
+    </div>
+  </div>
+
   <div class="class-tabs" id="class-tabs"></div>
 
   <div class="sec-tabs">

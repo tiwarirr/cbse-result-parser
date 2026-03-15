@@ -81,11 +81,25 @@ const sn = c => SN[c] || `Subj ${c}`;
 const raw = {X:null, XII:null};
 const DB = {X:[], XII:[]};
 const parseDiagnostics = {X:null, XII:null};
+const uploadRaw = {X:null, XII:null};
+const schoolSessions = {};
+let savedCombinations = [];
+let currentCombinedMerit = null;
 
 let charts = {};
 let activeCls = null;
 let activeSec = 'summary';
 let overlayState = null;
+let activeSessionId = null;
+const workspaceState = {
+  selectedSessionIds: [],
+  mode: 'single',
+  comparisonYear: 'all',
+  classScope: 'X',
+  meritScope: 'same-class',
+  activeCombinationId: null,
+};
+const COMBO_STORAGE_KEY = 'CBSE-MULTI-COMBINATIONS';
 
 /*
  * Shared student record contract used by renderers and exports:
@@ -94,6 +108,95 @@ let overlayState = null;
  */
 function createStudentRecord({rollNo, gender, name, result, cls, compSub, subjects}){
   return {rollNo, gender, name, result, cls, compSub, subjects};
+}
+
+function createSessionId(schoolCode, year){
+  return `${schoolCode || 'CBSE'}-${year || new Date().getFullYear()}`;
+}
+
+function getSessionLabel(session){
+  return session.schoolName || session.schoolCode || 'Unknown School';
+}
+
+function getActiveSessions(){
+  return workspaceState.selectedSessionIds
+    .map(id => schoolSessions[id])
+    .filter(Boolean);
+}
+
+function isMultiMode(){
+  return workspaceState.mode === 'multi' && getActiveSessions().length > 1;
+}
+
+function updateMixedYearBanner(){
+  const sessions = getActiveSessions();
+  const years = new Set(sessions.map(session => session.year).filter(Boolean));
+  const banner = document.getElementById('mixed-year-banner');
+  if(years.size > 1 && isMultiMode()) banner.classList.add('show');
+  else banner.classList.remove('show');
+}
+
+function renderActiveWorkspaceHeader(){
+  const sessions = getActiveSessions();
+  if(isMultiMode()){
+    const schoolCount = sessions.length;
+    const years = [...new Set(sessions.map(session => session.year).filter(Boolean))];
+    document.getElementById('hschool').textContent = 'Multi-School Workspace';
+    document.getElementById('hmeta').innerHTML =
+      `${schoolCount} school${schoolCount > 1 ? 's' : ''} selected` +
+      `<br><span style="opacity:.6">${workspaceState.classScope === 'all' ? 'All classes' : `Class ${workspaceState.classScope}`} &nbsp;&middot;&nbsp; ` +
+      `${workspaceState.comparisonYear === 'all' ? 'All years' : workspaceState.comparisonYear}` +
+      `${years.length > 1 ? ' &nbsp;&middot;&nbsp; Mixed years' : ''}</span>`;
+    return;
+  }
+
+  const session = activeSessionId ? schoolSessions[activeSessionId] : null;
+  if(!session){
+    document.getElementById('hschool').textContent = 'CBSE Result Dashboard';
+    document.getElementById('hmeta').textContent = '';
+    return;
+  }
+
+  document.getElementById('hschool').textContent = getSessionLabel(session);
+  document.getElementById('hmeta').innerHTML =
+    [DB.X.length ? `Class X: <strong style="color:var(--gold)">${DB.X.length}</strong>` : '',
+     DB.XII.length ? `Class XII: <strong style="color:#22d3ee">${DB.XII.length}</strong>` : '']
+      .filter(Boolean).join(' &nbsp;&middot;&nbsp; ') +
+    `<br><span style="opacity:.6">CBSE ${session.year}` +
+    (session.schoolCode ? ` &nbsp;&middot;&nbsp; School ${session.schoolCode}` : '') + `</span>`;
+}
+
+function formatStorageSize(bytes){
+  if(bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  if(bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function estimateLocalStorageUsageBytes(){
+  let total = 0;
+  for(let i = 0; i < localStorage.length; i++){
+    const key = localStorage.key(i) || '';
+    const value = localStorage.getItem(key) || '';
+    total += (key.length + value.length) * 2;
+  }
+  return total;
+}
+
+async function updateStorageIndicator(){
+  const valueEl = document.getElementById('storage-value');
+  const fillEl = document.getElementById('storage-fill');
+  if(!valueEl || !fillEl) return;
+
+  const usedBytes = estimateLocalStorageUsageBytes();
+  const fallbackQuota = 5 * 1024 * 1024;
+  const pctUsed = Math.min(100, (usedBytes / fallbackQuota) * 100);
+  valueEl.textContent = `${formatStorageSize(usedBytes)} used, ${formatStorageSize(Math.max(0, fallbackQuota - usedBytes))} free`;
+  fillEl.style.width = `${Math.max(2, pctUsed)}%`;
+  fillEl.style.background = pctUsed > 85
+    ? 'linear-gradient(90deg, #d05c33 0%, #b52c2c 100%)'
+    : pctUsed > 60
+      ? 'linear-gradient(90deg, #d7a63a 0%, #cf7e22 100%)'
+      : 'linear-gradient(90deg, #c9a84c 0%, #d48b1f 100%)';
 }
 
 function createParseDiagnostics(cls){
@@ -105,7 +208,7 @@ function addParseWarning(diagnostics, detail){
 }
 
 function resetCardState(cls){
-  raw[cls] = null;
+  uploadRaw[cls] = null;
   document.getElementById('card-'+cls).className = 'upload-card';
   document.getElementById('status-'+cls).textContent = '';
 }
@@ -130,12 +233,12 @@ function readFile(file, c){
     const detected = detectClass(text);
     const actualClass = detected || c;
     if(detected && detected !== c) resetCardState(c);
-    raw[actualClass] = text;
+    uploadRaw[actualClass] = text;
     const el = document.getElementById('status-'+actualClass);
     el.textContent = 'Loaded ' + file.name + (detected && detected !== c ? ' (auto-detected as Class '+detected+')' : '');
     el.style.color = actualClass==='X' ? 'var(--cx-dk)' : 'var(--cxii-dk)';
     document.getElementById('card-'+actualClass).className = 'upload-card loaded-'+actualClass;
-    document.getElementById('btn-analyze').disabled = !(raw.X || raw.XII);
+    document.getElementById('btn-analyze').disabled = !(uploadRaw.X || uploadRaw.XII);
   };
   r.readAsText(file,'UTF-8');
 }
@@ -249,6 +352,132 @@ function parseMeta(t) {
   };
 }
 
+function parseClassBundle(cls, text){
+  if(!text) return null;
+  const parsed = cls === 'X' ? parseX(text) : parseXII(text);
+  return {
+    rawText: text,
+    students: parsed.students,
+    diagnostics: parsed.diagnostics,
+  };
+}
+
+function buildSessionFromRawClasses(classes){
+  const sampleText = classes.X || classes.XII || '';
+  const meta = parseMeta(sampleText);
+  const schoolCode = meta.code || 'CBSE';
+  const year = String(meta.year || new Date().getFullYear());
+  const sessionId = createSessionId(schoolCode, year);
+  const classX = parseClassBundle('X', classes.X || null);
+  const classXII = parseClassBundle('XII', classes.XII || null);
+  return {
+    sessionId,
+    schoolCode,
+    schoolName: meta.school || schoolCode,
+    year,
+    parsed: {
+      X: classX ? classX.students.length : 0,
+      XII: classXII ? classXII.students.length : 0,
+    },
+    diagnostics: {
+      X: classX ? classX.diagnostics : null,
+      XII: classXII ? classXII.diagnostics : null,
+    },
+    classes: {
+      X: classX,
+      XII: classXII,
+    }
+  };
+}
+
+function mergeSessionIntoRegistry(session){
+  const existing = schoolSessions[session.sessionId];
+  if(existing){
+    schoolSessions[session.sessionId] = {
+      ...existing,
+      schoolName: session.schoolName || existing.schoolName,
+      parsed: {
+        X: session.classes.X ? session.classes.X.students.length : (existing.classes.X ? existing.classes.X.students.length : 0),
+        XII: session.classes.XII ? session.classes.XII.students.length : (existing.classes.XII ? existing.classes.XII.students.length : 0),
+      },
+      diagnostics: {
+        X: session.classes.X ? session.classes.X.diagnostics : existing.diagnostics?.X || null,
+        XII: session.classes.XII ? session.classes.XII.diagnostics : existing.diagnostics?.XII || null,
+      },
+      classes: {
+        X: session.classes.X || existing.classes.X,
+        XII: session.classes.XII || existing.classes.XII,
+      }
+    };
+  } else {
+    schoolSessions[session.sessionId] = session;
+  }
+  return schoolSessions[session.sessionId];
+}
+
+function applySessionToActiveData(sessionId, preferredCls){
+  const session = schoolSessions[sessionId];
+  if(!session) return;
+  activeSessionId = sessionId;
+  raw.X = session.classes.X ? session.classes.X.rawText : null;
+  raw.XII = session.classes.XII ? session.classes.XII.rawText : null;
+  DB.X = session.classes.X ? session.classes.X.students : [];
+  DB.XII = session.classes.XII ? session.classes.XII.students : [];
+  parseDiagnostics.X = session.classes.X ? session.classes.X.diagnostics : null;
+  parseDiagnostics.XII = session.classes.XII ? session.classes.XII.diagnostics : null;
+  const nextCls = preferredCls || (DB.X.length ? 'X' : DB.XII.length ? 'XII' : null);
+  activeCls = nextCls;
+  if(nextCls) document.getElementById('btn-export').style.display = 'inline-block';
+}
+
+function listSessionClassBadges(session){
+  return ['X','XII'].filter(cls => session.classes[cls]).map(cls =>
+    `<span class="cpill cpill-${cls}">Class ${cls}</span>`
+  ).join('');
+}
+
+function collectSavedCombinations(){
+  try {
+    const rawValue = localStorage.getItem(COMBO_STORAGE_KEY);
+    const combos = rawValue ? JSON.parse(rawValue) : [];
+    return Array.isArray(combos) ? combos : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistSavedCombinations(){
+  localStorage.setItem(COMBO_STORAGE_KEY, JSON.stringify(savedCombinations));
+}
+
+function persistSchoolSession(session){
+  ['X','XII'].forEach(cls => {
+    const classBundle = session.classes[cls];
+    const key = `${session.schoolCode}-${session.year}-${cls}`;
+    if(classBundle) localStorage.setItem(key, classBundle.rawText);
+  });
+}
+
+function rebuildSessionsFromLocalStorage(){
+  Object.keys(schoolSessions).forEach(key => delete schoolSessions[key]);
+  const pattern = /^(.+)-(\d{4})-(X|XII)$/;
+  const grouped = {};
+  for(let i=0;i<localStorage.length;i++){
+    const key = localStorage.key(i);
+    const match = key && key.match(pattern);
+    if(!match) continue;
+    const [, schoolCode, year, cls] = match;
+    const sessionId = createSessionId(schoolCode, year);
+    if(!grouped[sessionId]) grouped[sessionId] = {X:null, XII:null};
+    grouped[sessionId][cls] = localStorage.getItem(key);
+  }
+  Object.entries(grouped).forEach(([, classes]) => {
+    const session = buildSessionFromRawClasses(classes);
+    mergeSessionIntoRegistry(session);
+  });
+  savedCombinations = collectSavedCombinations();
+}
+
 function renderParseWarnings(){
   const banner = document.getElementById('parse-banner');
   const body = document.getElementById('parse-banner-body');
@@ -285,22 +514,19 @@ function renderParseWarnings(){
 }
 
 function runAnalysis(){
-  parseDiagnostics.X = null;
-  parseDiagnostics.XII = null;
-  DB.X = [];
-  DB.XII = [];
+  const staged = {X: uploadRaw.X, XII: uploadRaw.XII};
+  const session = buildSessionFromRawClasses(staged);
+  const merged = mergeSessionIntoRegistry(session);
+  persistSchoolSession(merged);
 
-  if(raw.X){
-    const parsedX = parseX(raw.X);
-    DB.X = parsedX.students;
-    parseDiagnostics.X = parsedX.diagnostics;
+  if(!workspaceState.selectedSessionIds.includes(merged.sessionId)){
+    workspaceState.selectedSessionIds = [...workspaceState.selectedSessionIds, merged.sessionId];
   }
-  if(raw.XII){
-    const parsedXII = parseXII(raw.XII);
-    DB.XII = parsedXII.students;
-    parseDiagnostics.XII = parsedXII.diagnostics;
-  }
+  activeSessionId = merged.sessionId;
+  workspaceState.mode = workspaceState.selectedSessionIds.length > 1 ? 'multi' : 'single';
+  workspaceState.activeCombinationId = null;
 
+  applySessionToActiveData(merged.sessionId);
   const tot = DB.X.length + DB.XII.length;
   if(!tot){
     renderParseWarnings();
@@ -308,60 +534,47 @@ function runAnalysis(){
     return;
   }
 
-  document.getElementById('upload-screen').style.display = 'none';
-  document.getElementById('dashboard').style.display = 'block';
-  document.getElementById('btn-export').style.display = 'inline-block';
-
   const meta = parseMeta(raw.X || raw.XII || '');
   if(meta.school) document.getElementById('hschool').textContent = meta.school;
 
-  document.getElementById('hmeta').innerHTML =
-    [DB.X.length ? `Class X: <strong style="color:var(--gold)">${DB.X.length}</strong>` : '',
-     DB.XII.length ? `Class XII: <strong style="color:#22d3ee">${DB.XII.length}</strong>` : '']
-      .filter(Boolean).join(' &nbsp;&middot;&nbsp; ') +
-    `<br><span style="opacity:.6">CBSE ${meta.year}` +
-    (meta.code ? ` &nbsp;&middot;&nbsp; School ${meta.code}` : '') +
-    (meta.region ? ` &nbsp;&middot;&nbsp; ${meta.region}` : '') + `</span>`;
-
-  renderParseWarnings();
-  buildClassTabs();
-  switchClass(DB.X.length ? 'X' : 'XII');
-  saveToLocalStorage();
-}
-
-function saveToLocalStorage(){
-  const meta = parseMeta(raw.X || raw.XII || '');
-  const code = meta.code || 'CBSE';
-  const year = meta.year || new Date().getFullYear();
-  ['X','XII'].forEach(c=>{
-    if(raw[c]) localStorage.setItem(`${code}-${year}-${c}`, raw[c]);
-  });
+  document.getElementById('upload-screen').style.display = 'none';
+  document.getElementById('dashboard').style.display = 'block';
+  document.getElementById('btn-export').style.display = 'inline-block';
+  document.getElementById('btn-add-school').style.display = 'inline-block';
   document.getElementById('btn-clear').style.display = 'inline-block';
   document.getElementById('btn-backup').style.display = 'inline-block';
+  document.getElementById('btn-upload-cancel').style.display = 'none';
+
+  uploadRaw.X = null;
+  uploadRaw.XII = null;
+  resetCardState('X');
+  resetCardState('XII');
+  document.getElementById('btn-analyze').disabled = true;
+
+  renderParseWarnings();
+  renderWorkspacePanel();
+  renderActiveWorkspaceHeader();
+  buildClassTabs();
+  switchClass(DB.X.length ? 'X' : 'XII');
 }
 
+function saveToLocalStorage(){ /* school sessions are persisted during runAnalysis */ }
+
 function clearSavedData(){
-  const meta = parseMeta(raw.X || raw.XII || '');
-  const code = meta.code || 'CBSE';
-  const year = meta.year || new Date().getFullYear();
-  ['X','XII'].forEach(c=>localStorage.removeItem(`${code}-${year}-${c}`));
+  const sessions = getActiveSessions();
+  sessions.forEach(session => {
+    ['X','XII'].forEach(cls => localStorage.removeItem(`${session.schoolCode}-${session.year}-${cls}`));
+  });
+  const removedIds = new Set(sessions.map(session => session.sessionId));
+  savedCombinations = savedCombinations.filter(combo =>
+    !combo.selectedSessionIds.some(id => removedIds.has(id))
+  );
+  persistSavedCombinations();
   location.reload();
 }
 
 function collectSavedSessions(){
-  const pattern = /^(.+)-(\d{4})-(X|XII)$/;
-  const sessionsMap = {};
-  for(let i=0;i<localStorage.length;i++){
-    const key = localStorage.key(i);
-    const match = key && key.match(pattern);
-    if(!match) continue;
-    const [, code, year, cls] = match;
-    const sessionKey = `${code}-${year}`;
-    if(!sessionsMap[sessionKey]) sessionsMap[sessionKey] = {schoolCode:code, year, classes:{}};
-    sessionsMap[sessionKey].classes[cls] = localStorage.getItem(key);
-  }
-
-  return Object.values(sessionsMap).sort((a,b)=>{
+  return Object.values(schoolSessions).sort((a,b)=>{
     const yearDiff = String(b.year).localeCompare(String(a.year));
     if(yearDiff) return yearDiff;
     return String(a.schoolCode).localeCompare(String(b.schoolCode));
@@ -380,7 +593,15 @@ function exportBackup(){
     version: 1,
     exportedAt: new Date().toISOString(),
     generator: 'CBSE Result Dashboard',
-    sessions
+    sessions: sessions.map(session => ({
+      schoolCode: session.schoolCode,
+      year: session.year,
+      classes: {
+        ...(session.classes.X ? {X: session.classes.X.rawText} : {}),
+        ...(session.classes.XII ? {XII: session.classes.XII.rawText} : {}),
+      }
+    })),
+    combinations: savedCombinations
   };
 
   const blob = new Blob([JSON.stringify(backup, null, 2)], {type:'application/json'});
@@ -394,7 +615,187 @@ function exportBackup(){
 }
 
 function getSessionMeta(session){
-  return parseMeta(Object.values(session.classes)[0] || '');
+  if(session.schoolName) return {school: session.schoolName, code: session.schoolCode, year: session.year};
+  const rawClass = session.classes?.X || session.classes?.XII || '';
+  const text = typeof rawClass === 'string' ? rawClass : rawClass?.rawText || '';
+  const meta = parseMeta(text);
+  return {school: meta.school || session.schoolCode, code: session.schoolCode, year: session.year};
+}
+
+function syncWorkspaceControls(){
+  const modeEl = document.getElementById('workspace-mode');
+  const yearEl = document.getElementById('compare-year');
+  const classEl = document.getElementById('compare-class');
+  const meritEl = document.getElementById('compare-merit-scope');
+  if(modeEl) modeEl.value = workspaceState.mode;
+  if(classEl) classEl.value = workspaceState.classScope;
+  if(meritEl) meritEl.value = workspaceState.meritScope;
+  if(yearEl){
+    const sessions = collectSavedSessions();
+    const years = [...new Set(sessions.map(session => session.year))].sort().reverse();
+    yearEl.innerHTML = `<option value="all">All Years</option>` + years.map(year =>
+      `<option value="${year}">${year}</option>`
+    ).join('');
+    yearEl.value = years.includes(workspaceState.comparisonYear) ? workspaceState.comparisonYear : 'all';
+    workspaceState.comparisonYear = yearEl.value;
+  }
+}
+
+function renderWorkspacePanel(){
+  syncWorkspaceControls();
+  const sessions = collectSavedSessions();
+  const sessionList = document.getElementById('session-list');
+  const comboList = document.getElementById('combination-list');
+  const workspaceSub = document.getElementById('workspace-sub');
+  const selectedCount = getActiveSessions().length;
+  workspaceSub.textContent = selectedCount
+    ? `${selectedCount} school${selectedCount > 1 ? 's' : ''} selected. Use Multi-School mode for comparison and combined merit.`
+    : 'Upload or restore schools to start a multischool workspace.';
+
+  sessionList.innerHTML = sessions.length ? sessions.map(session => {
+    const selected = workspaceState.selectedSessionIds.includes(session.sessionId);
+    return `<div class="session-card ${selected ? 'selected' : ''}">
+      <div class="session-meta">
+        <div class="session-title">${getSessionLabel(session)}</div>
+        <div class="session-sub">${session.schoolCode} | ${session.year}</div>
+        <div class="session-badges">${listSessionClassBadges(session)}</div>
+      </div>
+      <div class="session-actions">
+        <button class="session-select" onclick="toggleSessionSelection('${session.sessionId}')">${selected ? 'Remove' : 'Select'}</button>
+        <button class="session-open" onclick="openSingleSession('${session.sessionId}')">Open</button>
+      </div>
+    </div>`;
+  }).join('') : '<div class="workspace-empty">No saved schools yet.</div>';
+
+  comboList.innerHTML = savedCombinations.length ? savedCombinations.map(combo => `
+    <div class="combo-card">
+      <div class="session-meta">
+        <div class="session-title">${combo.name}</div>
+        <div class="combo-meta">${combo.selectedSessionIds.length} schools | Default class ${combo.defaultClassScope || 'X'} | ${combo.meritScope || 'same-class'}</div>
+      </div>
+      <button class="combo-open" onclick="openCombination('${combo.id}')">Open</button>
+    </div>
+  `).join('') : '<div class="workspace-empty">No saved combinations yet.</div>';
+
+  updateMixedYearBanner();
+  renderActiveWorkspaceHeader();
+  updateStorageIndicator();
+  document.getElementById('dashboard').style.display = sessions.length ? 'block' : document.getElementById('dashboard').style.display;
+}
+
+function toggleSessionSelection(sessionId){
+  if(workspaceState.selectedSessionIds.includes(sessionId)){
+    workspaceState.selectedSessionIds = workspaceState.selectedSessionIds.filter(id => id !== sessionId);
+  } else {
+    workspaceState.selectedSessionIds = [...workspaceState.selectedSessionIds, sessionId];
+  }
+  if(workspaceState.selectedSessionIds.length <= 1){
+    workspaceState.mode = 'single';
+    if(workspaceState.selectedSessionIds.length === 1) openSingleSession(workspaceState.selectedSessionIds[0]);
+    else {
+      activeSessionId = null;
+      activeCls = null;
+      renderWorkspacePanel();
+      buildClassTabs();
+      renderSec();
+    }
+  } else {
+    workspaceState.mode = 'multi';
+    renderWorkspacePanel();
+    buildClassTabs();
+    renderSec();
+  }
+}
+
+function openSingleSession(sessionId){
+  const session = schoolSessions[sessionId];
+  if(!session) return;
+  workspaceState.selectedSessionIds = [sessionId];
+  workspaceState.mode = 'single';
+  workspaceState.activeCombinationId = null;
+  applySessionToActiveData(sessionId);
+  document.getElementById('dashboard').style.display = 'block';
+  document.getElementById('btn-export').style.display = 'inline-block';
+  document.getElementById('btn-add-school').style.display = 'inline-block';
+  renderParseWarnings();
+  renderWorkspacePanel();
+  buildClassTabs();
+  switchClass(DB.X.length ? 'X' : 'XII');
+}
+
+function onWorkspaceModeChange(){
+  const modeEl = document.getElementById('workspace-mode');
+  workspaceState.mode = modeEl.value;
+  if(workspaceState.mode === 'single' && workspaceState.selectedSessionIds.length){
+    openSingleSession(workspaceState.selectedSessionIds[0]);
+    return;
+  }
+  renderWorkspacePanel();
+  buildClassTabs();
+  renderSec();
+}
+
+function onWorkspaceFilterChange(){
+  workspaceState.comparisonYear = document.getElementById('compare-year').value;
+  workspaceState.classScope = document.getElementById('compare-class').value;
+  workspaceState.meritScope = document.getElementById('compare-merit-scope').value;
+  renderWorkspacePanel();
+  renderSec();
+}
+
+function promptSaveCombination(){
+  const selected = getActiveSessions();
+  if(selected.length < 2){
+    alert('Select at least two schools before saving a combination.');
+    return;
+  }
+  const name = window.prompt('Combination name', `Combination ${savedCombinations.length + 1}`);
+  if(!name) return;
+  const now = new Date().toISOString();
+  const combo = {
+    id: `combo-${Date.now()}`,
+    name,
+    selectedSessionIds: [...workspaceState.selectedSessionIds],
+    defaultClassScope: workspaceState.classScope,
+    meritScope: workspaceState.meritScope,
+    createdAt: now,
+    updatedAt: now,
+  };
+  savedCombinations = [...savedCombinations, combo];
+  persistSavedCombinations();
+  renderWorkspacePanel();
+}
+
+function openCombination(comboId){
+  const combo = savedCombinations.find(item => item.id === comboId);
+  if(!combo) return;
+  const existingIds = combo.selectedSessionIds.filter(id => schoolSessions[id]);
+  const missingCount = combo.selectedSessionIds.length - existingIds.length;
+  workspaceState.selectedSessionIds = existingIds;
+  workspaceState.classScope = combo.defaultClassScope || 'X';
+  workspaceState.meritScope = combo.meritScope || 'same-class';
+  workspaceState.mode = existingIds.length > 1 ? 'multi' : 'single';
+  workspaceState.activeCombinationId = comboId;
+  if(missingCount){
+    alert(`Combination restored partially. ${missingCount} saved school reference(s) were not found in local storage.`);
+  }
+  if(workspaceState.mode === 'single' && existingIds[0]) openSingleSession(existingIds[0]);
+  else {
+    renderWorkspacePanel();
+    buildClassTabs();
+    renderSec();
+  }
+}
+
+function showUploadScreen(){
+  document.getElementById('upload-screen').style.display = 'flex';
+  document.getElementById('btn-upload-cancel').style.display = document.getElementById('dashboard').style.display === 'block' ? 'inline-block' : 'none';
+}
+
+function hideUploadScreen(){
+  if(document.getElementById('dashboard').style.display === 'block'){
+    document.getElementById('upload-screen').style.display = 'none';
+  }
 }
 
 function openSessionOverlay(config){
@@ -407,8 +808,18 @@ function openSessionOverlay(config){
   loadBtn.textContent = config.buttonLabel || 'Load Selected';
   loadBtn.disabled = true;
 
-  container.innerHTML = config.sessions.map((session, i) => {
-    const clsList = Object.keys(session.classes);
+  container.innerHTML = config.items.map((item, i) => {
+    if(item.kind === 'combination'){
+      return `<div class="import-session" data-idx="${i}" onclick="selectImportSession(this)">
+        <div style="font-size:16px;font-weight:800;font-family:'DM Mono',monospace">C${i + 1}</div>
+        <div class="import-session-info">
+          <div class="import-session-name">${item.name}</div>
+          <div class="import-session-meta">${item.selectedSessionIds.length} schools &nbsp;&middot;&nbsp; default ${item.defaultClassScope || 'X'}</div>
+        </div>
+      </div>`;
+    }
+    const session = item;
+    const clsList = Object.keys(session.classes || {});
     const meta = getSessionMeta(session);
     const schoolName = meta.school || session.schoolCode;
     const classBadges = clsList.map(c =>
@@ -424,7 +835,7 @@ function openSessionOverlay(config){
     </div>`;
   }).join('');
 
-  if(config.sessions.length === 1){
+  if(config.items.length === 1){
     const card = container.querySelector('.import-session');
     if(card){
       card.classList.add('selected');
@@ -456,11 +867,15 @@ function handleImportFile(e){
 
     const exportedAt = new Date(data.exportedAt);
     const dateText = isNaN(exportedAt) ? '' : ` Backed up ${exportedAt.toLocaleDateString('en-IN', {day:'numeric', month:'short', year:'numeric'})}.`;
+    const items = [
+      ...data.sessions.map(session => ({...session, kind:'session'})),
+      ...((data.combinations || []).map(combo => ({...combo, kind:'combination'})))
+    ];
     openSessionOverlay({
       mode:'backup',
-      sessions:data.sessions,
+      items,
       title:'Restore from Backup',
-      description:`${data.sessions.length} session${data.sessions.length > 1 ? 's' : ''} found in this backup.${dateText} Select one to load.`,
+      description:`${items.length} saved item${items.length > 1 ? 's' : ''} found in this backup.${dateText} Select one to load.`,
       buttonLabel:'Load Selected'
     });
   };
@@ -485,10 +900,12 @@ function showRestoreBanner(message){
 }
 
 function restoreSession(session, source){
-  raw.X = session.classes.X || null;
-  raw.XII = session.classes.XII || null;
+  mergeSessionIntoRegistry(buildSessionFromRawClasses({
+    X: session.classes?.X?.rawText || session.classes?.X || null,
+    XII: session.classes?.XII?.rawText || session.classes?.XII || null,
+  }));
+  openSingleSession(createSessionId(session.schoolCode, session.year));
   showRestoreBanner(`${source} - School ${session.schoolCode} | ${session.year}`);
-  runAnalysis();
 }
 
 function doImport(){
@@ -500,46 +917,75 @@ function doImport(){
   }
 
   const idx = parseInt(selected.dataset.idx, 10);
-  const session = overlayState.sessions[idx];
-  if(!session){
-    alert('Session data not found.');
+  const item = overlayState.items[idx];
+  if(!item){
+    alert('Saved item not found.');
     return;
   }
 
   if(overlayState.mode === 'backup'){
-    Object.entries(session.classes).forEach(([cls, text]) => {
-      localStorage.setItem(`${session.schoolCode}-${session.year}-${cls}`, text);
-    });
+    if(item.kind === 'session'){
+      Object.entries(item.classes).forEach(([cls, text]) => {
+        localStorage.setItem(`${item.schoolCode}-${item.year}-${cls}`, text);
+      });
+      rebuildSessionsFromLocalStorage();
+      closeImportOverlay();
+      restoreSession(item, 'Data restored from backup');
+      return;
+    }
+    savedCombinations = [...savedCombinations, {...item, kind:undefined}];
+    persistSavedCombinations();
+    rebuildSessionsFromLocalStorage();
     closeImportOverlay();
-    restoreSession(session, 'Data restored from backup');
+    openCombination(item.id);
     return;
   }
 
   closeImportOverlay();
-  restoreSession(session, 'Data restored from saved session');
+  if(item.kind === 'combination'){
+    openCombination(item.id);
+    return;
+  }
+  restoreSession(item, 'Data restored from saved session');
 }
 
 function tryRestoreFromLocalStorage(){
+  rebuildSessionsFromLocalStorage();
   const sessions = collectSavedSessions();
-  if(!sessions.length) return;
+  if(!sessions.length){
+    renderWorkspacePanel();
+    return;
+  }
 
-  if(sessions.length === 1){
-    restoreSession(sessions[0], 'Data restored from saved session');
+  if(sessions.length === 1 && !savedCombinations.length){
+    openSingleSession(sessions[0].sessionId);
+    showRestoreBanner(`Data restored from saved session - School ${sessions[0].schoolCode} | ${sessions[0].year}`);
     return;
   }
 
   openSessionOverlay({
     mode:'saved',
-    sessions,
-    title:'Choose Saved Session',
-    description:`${sessions.length} saved sessions were found in this browser. Select one to restore.`,
+    items: [
+      ...sessions.map(session => ({...session, kind:'session'})),
+      ...savedCombinations.map(combo => ({...combo, kind:'combination'}))
+    ],
+    title:'Choose Saved Item',
+    description:`Saved schools and combinations were found in this browser. Select one to restore.`,
     buttonLabel:'Restore Selected'
   });
+  document.getElementById('dashboard').style.display = 'block';
+  document.getElementById('btn-add-school').style.display = 'inline-block';
+  renderWorkspacePanel();
   document.getElementById('btn-backup').style.display = 'inline-block';
 }
 /* ── CLASS TABS ── */
 function buildClassTabs(){
   const bar = document.getElementById('class-tabs');
+  if(isMultiMode()){
+    bar.style.display = 'none';
+    return;
+  }
+  bar.style.display = 'flex';
   bar.innerHTML = '';
   ['X','XII'].forEach(c => {
     if(!DB[c].length) return;
@@ -580,6 +1026,14 @@ function showSec(name, btn){
 }
 
 function renderSec(){
+  if(isMultiMode()){
+    if(activeSec==='summary')  renderMultischoolSummary();
+    if(activeSec==='merit')    renderCombinedMerit();
+    if(activeSec==='subjects' || activeSec==='gender' || activeSec==='students'){
+      renderMultiPlaceholder(activeSec);
+    }
+    return;
+  }
   if(!activeCls) return;
   if(activeSec==='summary')  renderSummary(activeCls);
   if(activeSec==='subjects') renderSubjects(activeCls);
@@ -633,6 +1087,207 @@ function stripe(cls, students){
       <div class="cs-big-lbl">Pass Rate</div>
     </div>
   </div>`;
+}
+
+function getComparisonSessions(){
+  return getActiveSessions().filter(session =>
+    workspaceState.comparisonYear === 'all' || String(session.year) === String(workspaceState.comparisonYear)
+  );
+}
+
+function getStudentsForScope(session, scope){
+  if(scope === 'all'){
+    return [
+      ...(session.classes.X ? session.classes.X.students : []),
+      ...(session.classes.XII ? session.classes.XII.students : [])
+    ];
+  }
+  return session.classes[scope] ? session.classes[scope].students : [];
+}
+
+function getScopedTopper(session, scope){
+  const students = getStudentsForScope(session, scope).filter(s => s.result === 'PASS' || s.result === 'COMP');
+  if(!students.length) return null;
+  const topperPool = students.map(student => {
+    const engCode = student.cls === 'XII' ? '301' : '184';
+    const score = computeScore(student, {mode:'bestNEng', n:5, engCode});
+    return {...student, schoolCode: session.schoolCode, schoolName: session.schoolName, year: session.year, _pct: score.pct};
+  }).sort((a,b) => b._pct - a._pct);
+  return topperPool[0];
+}
+
+function renderMultiPlaceholder(section){
+  const titles = {
+    subjects: 'Subject analysis remains school-specific in this release.',
+    gender: 'Gender analysis remains school-specific in this release.',
+    students: 'The all students table remains school-specific in this release.'
+  };
+  const target = section === 'subjects' ? 'd-subjects' : section === 'gender' ? 'd-gender' : 'd-students';
+  document.getElementById(target).innerHTML = `<div class="compare-note">${titles[section]} Open one school to use this tab, or use Summary and Merit for multischool comparison.</div>`;
+}
+
+function renderMultischoolSummary(){
+  const sessions = getComparisonSessions();
+  if(!sessions.length){
+    document.getElementById('d-summary').innerHTML = '<div class="compare-note">No schools selected for comparison.</div>';
+    return;
+  }
+
+  const scope = workspaceState.classScope;
+  const rows = sessions.map(session => {
+    const students = getStudentsForScope(session, scope);
+    const stats = st(students);
+    const topper = getScopedTopper(session, scope);
+    return {
+      session,
+      students,
+      stats,
+      avgTotal: avg(students.filter(s => s.result === 'PASS').map(s => tm(s))).toFixed(1),
+      topper
+    };
+  }).filter(row => row.students.length);
+
+  if(!rows.length){
+    document.getElementById('d-summary').innerHTML = '<div class="compare-note">No student data available for the selected year/class scope.</div>';
+    return;
+  }
+
+  const subjectSet = new Map();
+  rows.forEach(row => {
+    row.students.forEach(student => {
+      student.subjects.forEach(subject => {
+        if(!subjectSet.has(subject.code)) subjectSet.set(subject.code, subject.name);
+      });
+    });
+  });
+  const subjectRows = [...subjectSet.entries()].map(([code, name]) => {
+    const cells = rows.map(row => {
+      const marks = row.students.flatMap(student => student.subjects.filter(subject => subject.code === code && subject.grade !== 'AB').map(subject => subject.marks));
+      return marks.length ? avg(marks).toFixed(1) : '—';
+    });
+    return {code, name, cells};
+  });
+
+  document.getElementById('d-summary').innerHTML = `
+    <div class="sec-h">
+      <div class="sec-title">School Comparison</div>
+      <div class="sec-sub">${scope === 'all' ? 'All classes' : `Class ${scope}`} across ${rows.length} selected school${rows.length > 1 ? 's' : ''}</div>
+    </div>
+    <div class="comparison-grid">
+      ${rows.map(row => `
+        <div class="card">
+          <div class="card-title">${row.session.schoolName}</div>
+          <div class="slbl">School ${row.session.schoolCode} · ${row.session.year}</div>
+          <div class="stat-grid" style="margin-top:14px">
+            ${sc('Students', row.stats.n, `${row.stats.pct}% pass`, 'blue')}
+            ${sc('Pass', row.stats.pass, `${row.stats.comp} compartment`, 'green')}
+            ${sc('Absent', row.stats.abst, `${row.stats.n - row.stats.pass - row.stats.comp - row.stats.abst} fail`, 'red')}
+            ${sc('Avg Total', row.avgTotal, 'PASS students only', 'amber')}
+          </div>
+          <div style="font-size:13px;color:#777;margin-top:10px">
+            ${row.topper ? `Topper: <strong>${row.topper.name}</strong> (${row.topper._pct.toFixed(2)}%)` : 'No topper data'}
+          </div>
+        </div>
+      `).join('')}
+    </div>
+    <div class="two-col">
+      <div class="card">
+        <div class="card-title">Core Metrics by School</div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>School</th><th>Year</th><th>Total</th><th>Pass</th><th>Comp</th><th>Absent</th><th>Pass %</th><th>Avg Total</th></tr></thead>
+            <tbody>
+              ${rows.map(row => `
+                <tr>
+                  <td><strong>${row.session.schoolName}</strong><div style="font-size:11px;color:#999">School ${row.session.schoolCode}</div></td>
+                  <td>${row.session.year}</td>
+                  <td>${row.stats.n}</td>
+                  <td>${row.stats.pass}</td>
+                  <td>${row.stats.comp}</td>
+                  <td>${row.stats.abst}</td>
+                  <td style="font-family:'DM Mono',monospace;font-weight:700;color:var(--green)">${row.stats.pct}%</td>
+                  <td>${row.avgTotal}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Topper Comparison</div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>School</th><th>Topper</th><th>Class</th><th>Score %</th></tr></thead>
+            <tbody>
+              ${rows.map(row => `
+                <tr>
+                  <td><strong>${row.session.schoolName}</strong></td>
+                  <td>${row.topper ? row.topper.name : '—'}</td>
+                  <td>${row.topper ? row.topper.cls : '—'}</td>
+                  <td style="font-family:'DM Mono',monospace;font-weight:700;color:var(--green)">${row.topper ? row.topper._pct.toFixed(2)+'%' : '—'}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Subject Averages by School</div>
+      <div class="tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Subject</th>
+              <th>Code</th>
+              ${rows.map(row => `<th>${row.session.schoolCode}</th>`).join('')}
+            </tr>
+          </thead>
+          <tbody>
+            ${subjectRows.map(row => `
+              <tr>
+                <td><strong>${row.name}</strong></td>
+                <td style="font-family:'DM Mono',monospace">${row.code}</td>
+                ${row.cells.map(cell => `<td>${cell}</td>`).join('')}
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+function detectEngCodeFromStudents(cls, students){
+  const engCodes = cls === 'XII' ? ['301','302','001','002','118','120'] : ['184','001','002','085'];
+  const allCodes = new Set();
+  students.forEach(student => student.subjects.forEach(subject => allCodes.add(subject.code)));
+  return engCodes.find(code => allCodes.has(code)) || (cls === 'XII' ? '301' : '184');
+}
+
+function getCombinedMeritPool(settings){
+  const sessions = getComparisonSessions();
+  const meritScope = workspaceState.meritScope;
+  if(meritScope === 'same-class' && workspaceState.classScope === 'all') return {error:'Choose Class X or Class XII for same-class combined merit.'};
+  let pool = [];
+  sessions.forEach(session => {
+    const scopes = meritScope === 'all-classes' && workspaceState.classScope === 'all' ? ['X','XII'] : [workspaceState.classScope === 'all' ? 'X' : workspaceState.classScope];
+    scopes.forEach(cls => {
+      const students = getStudentsForScope(session, cls).filter(student => student.result === 'PASS' || student.result === 'COMP');
+      const engCode = detectEngCodeFromStudents(cls, students);
+      students.forEach(student => {
+        const score = computeScore(student, {...settings, engCode: settings.mode === 'bestNEng' ? engCode : settings.engCode});
+        pool.push({
+          ...student,
+          schoolCode: session.schoolCode,
+          schoolName: session.schoolName,
+          year: session.year,
+          _pct: score.pct,
+          _used: score.used
+        });
+      });
+    });
+  });
+  return {pool};
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -939,6 +1594,10 @@ function computeScore(s, settings){
 }
 
 function renderMerit(cls){
+  if(isMultiMode()){
+    renderCombinedMerit();
+    return;
+  }
   const sts=DB[cls];
   if(!sts.length){document.getElementById('d-merit').innerHTML=nodata();return;}
 
@@ -1011,6 +1670,10 @@ function onMeritModeChange(cls){
 }
 
 function drawMerit(cls){
+  if(isMultiMode()){
+    drawCombinedMerit();
+    return;
+  }
   const gf   = document.getElementById('mg-'+cls)?.value||'all';
   const cf   = document.getElementById('mc-'+cls)?.value||'10';
   const mode = document.getElementById('mm-'+cls)?.value||'bestNEng';
@@ -1086,6 +1749,116 @@ function drawMerit(cls){
       }).join('') : '<tr><td colspan="7" style="text-align:center;padding:32px;color:#ccc">No students found</td></tr>'}
       </tbody>
     </table>`;
+}
+
+function renderCombinedMerit(){
+  document.getElementById('d-merit').innerHTML = `
+    <div class="sec-h">
+      <div class="sec-title">Combined Merit List</div>
+      <div class="sec-sub">Across selected schools with source school, year, and class labels.</div>
+    </div>
+    <div class="card" style="margin-bottom:14px;background:#faf8f4;border:1px solid var(--border)">
+      <div style="font-family:'DM Serif Display',serif;font-size:14px;color:var(--ink);margin-bottom:12px">Combined Merit Settings</div>
+      <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end">
+        <div>
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#aaa;margin-bottom:6px">Scoring Mode</div>
+          <select class="sselect" id="cm-mode" onchange="drawCombinedMerit()">
+            <option value="bestNEng">Best N with English</option>
+            <option value="bestN">Best N (any subjects)</option>
+            <option value="all">All Subjects</option>
+          </select>
+        </div>
+        <div id="cm-n-wrap">
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#aaa;margin-bottom:6px">N (count)</div>
+          <input type="number" class="sinput" id="cm-n" value="5" min="1" max="9" style="width:72px;padding:9px 12px;border-radius:50px" oninput="drawCombinedMerit()">
+        </div>
+        <div>
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#aaa;margin-bottom:6px">Gender</div>
+          <select class="sselect" id="cm-g" onchange="drawCombinedMerit()">
+            <option value="all">All Students</option>
+            <option value="M">Boys only</option>
+            <option value="F">Girls only</option>
+          </select>
+        </div>
+        <div>
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#aaa;margin-bottom:6px">Show</div>
+          <select class="sselect" id="cm-c" onchange="drawCombinedMerit()">
+            <option value="10">Top 10</option>
+            <option value="25">Top 25</option>
+            <option value="50">Top 50</option>
+            <option value="all">All</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="tbl-wrap" id="combined-merit-table"></div>
+    </div>`;
+  drawCombinedMerit();
+}
+
+function drawCombinedMerit(){
+  const mode = document.getElementById('cm-mode')?.value || 'bestNEng';
+  const n = document.getElementById('cm-n')?.value || '5';
+  const gender = document.getElementById('cm-g')?.value || 'all';
+  const count = document.getElementById('cm-c')?.value || '10';
+  const settings = {mode, n, engCode:'301'};
+  const meritResult = getCombinedMeritPool(settings);
+  const container = document.getElementById('combined-merit-table');
+  if(!container) return;
+  if(meritResult.error){
+    container.innerHTML = `<div class="compare-note">${meritResult.error}</div>`;
+    currentCombinedMerit = null;
+    return;
+  }
+
+  let pool = meritResult.pool;
+  if(gender !== 'all') pool = pool.filter(student => student.gender === gender);
+  pool.sort((a,b) => {
+    if(Math.abs(b._pct - a._pct) > 0.001) return b._pct - a._pct;
+    const engA = a.subjects.find(subject => ['184','301','302','001','002','085'].includes(subject.code))?.marks || 0;
+    const engB = b.subjects.find(subject => ['184','301','302','001','002','085'].includes(subject.code))?.marks || 0;
+    if(engB !== engA) return engB - engA;
+    const maxA = Math.max(...a.subjects.map(subject => subject.marks || 0));
+    const maxB = Math.max(...b.subjects.map(subject => subject.marks || 0));
+    return maxB - maxA;
+  });
+  if(count !== 'all') pool = pool.slice(0, parseInt(count, 10));
+  let currentRank = 0;
+  pool.forEach((student, index) => {
+    if(index > 0 && Math.abs(student._pct - pool[index - 1]._pct) < 0.001) student._rank = pool[index - 1]._rank;
+    else {
+      currentRank += 1;
+      student._rank = currentRank;
+    }
+  });
+  currentCombinedMerit = {pool, settings, meritScope: workspaceState.meritScope, classScope: workspaceState.classScope};
+
+  container.innerHTML = `<table>
+    <thead><tr>
+      <th>Rank</th><th>Name</th><th>School</th><th>Year</th><th>Class</th><th>Roll No</th><th>Gender</th><th>Result</th><th style="text-align:right">Score %</th><th>Subject Marks</th>
+    </tr></thead>
+    <tbody>
+      ${pool.length ? pool.map(student => {
+        const usedSet = new Set(student._used);
+        const r = student._rank;
+        const bc = r===1?'r1':r===2?'r2':r===3?'r3':'';
+        const subHtml = student.subjects.map(sub => `<span class="gr g-${sub.grade.toLowerCase()}" style="${usedSet.has(sub.code)?'font-weight:800;border:2px solid currentColor':'opacity:.35'}">${sub.code}: ${sub.marks}</span>`).join(' ');
+        return `<tr>
+          <td><span class="rnk ${bc}">${r}</span></td>
+          <td><strong>${student.name}</strong></td>
+          <td><strong>${student.schoolName}</strong><div style="font-size:11px;color:#999">School ${student.schoolCode}</div></td>
+          <td>${student.year}</td>
+          <td>${student.cls}</td>
+          <td style="font-family:'DM Mono',monospace;font-size:12px;color:#bbb">${student.rollNo}</td>
+          <td>${student.gender==='F'?'Girl':'Boy'}</td>
+          <td>${student.result}</td>
+          <td style="font-family:'DM Mono',monospace;font-size:18px;font-weight:700;text-align:right;color:var(--green)">${student._pct.toFixed(2)}%</td>
+          <td>${subHtml}</td>
+        </tr>`;
+      }).join('') : '<tr><td colspan="10" style="text-align:center;padding:32px;color:#ccc">No students found</td></tr>'}
+    </tbody>
+  </table>`;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -1493,7 +2266,124 @@ function exportCurrentView(cls){
   XLSX.utils.book_append_sheet(wb, ws, `Class ${cls}`);
   XLSX.writeFile(wb, `CBSE_Class${cls}_${isFiltered?'Filtered_':''}${school}_${meta.year||''}.xlsx`);
 }
+
+function exportMultischoolWorkbook(){
+  if(!window.XLSX){
+    alert('Excel library not loaded yet - please wait a moment and try again.');
+    return;
+  }
+
+  const sessions = getComparisonSessions();
+  if(!sessions.length){
+    alert('No schools are selected for multischool export.');
+    return;
+  }
+
+  const wb = XLSX.utils.book_new();
+  const summaryRows = [[
+    'School Name','School Code','Year','Scope','Students','Pass','Compartment','Absent','Fail','Pass %','Average Total','Topper','Topper Score %'
+  ]];
+
+  const subjectMap = new Map();
+  sessions.forEach(session => {
+    const students = getStudentsForScope(session, workspaceState.classScope);
+    if(!students.length) return;
+    const stats = st(students);
+    const fail = stats.n - stats.pass - stats.comp - stats.abst;
+    const avgTotal = avg(students.filter(student => student.result === 'PASS').map(student => tm(student)));
+    const topper = getScopedTopper(session, workspaceState.classScope);
+    summaryRows.push([
+      session.schoolName,
+      session.schoolCode,
+      session.year,
+      workspaceState.classScope === 'all' ? 'All Classes' : `Class ${workspaceState.classScope}`,
+      stats.n,
+      stats.pass,
+      stats.comp,
+      stats.abst,
+      fail,
+      Number(stats.pct),
+      Number(avgTotal.toFixed(1)),
+      topper ? topper.name : '',
+      topper ? Number(topper._pct.toFixed(2)) : ''
+    ]);
+
+    students.forEach(student => {
+      student.subjects.forEach(subject => {
+        const key = `${subject.code}|${subject.name}`;
+        if(!subjectMap.has(key)) subjectMap.set(key, []);
+        subjectMap.get(key).push({session, subject});
+      });
+    });
+  });
+
+  const summarySheet = XLSX.utils.aoa_to_sheet(summaryRows);
+  summarySheet['!cols'] = [
+    {wch:28},{wch:14},{wch:8},{wch:14},{wch:10},{wch:10},{wch:14},{wch:10},{wch:8},{wch:10},{wch:12},{wch:24},{wch:14}
+  ];
+  XLSX.utils.book_append_sheet(wb, summarySheet, 'Comparison');
+
+  const subjectRows = [['Subject','Code', ...sessions.map(session => `${session.schoolCode} (${session.year})`)]];
+  [...subjectMap.entries()]
+    .sort((a,b) => a[0].localeCompare(b[0]))
+    .forEach(([key]) => {
+      const [code, name] = key.split('|');
+      const cells = sessions.map(session => {
+        const students = getStudentsForScope(session, workspaceState.classScope);
+        const marks = students.flatMap(student =>
+          student.subjects
+            .filter(subject => subject.code === code && subject.grade !== 'AB')
+            .map(subject => subject.marks)
+        );
+        return marks.length ? Number(avg(marks).toFixed(1)) : 'NA';
+      });
+      subjectRows.push([name, code, ...cells]);
+    });
+  const subjectSheet = XLSX.utils.aoa_to_sheet(subjectRows);
+  subjectSheet['!cols'] = [{wch:30},{wch:10}, ...sessions.map(() => ({wch:16}))];
+  XLSX.utils.book_append_sheet(wb, subjectSheet, 'Subject Averages');
+
+  if(currentCombinedMerit && currentCombinedMerit.pool && currentCombinedMerit.pool.length){
+    const meritRows = [[
+      'Rank','Name','School Name','School Code','Year','Class','Roll No','Gender','Result','Score %','Used Subjects','Subject Marks'
+    ]];
+    currentCombinedMerit.pool.forEach(student => {
+      meritRows.push([
+        student._rank,
+        student.name,
+        student.schoolName,
+        student.schoolCode,
+        student.year,
+        student.cls,
+        student.rollNo,
+        student.gender === 'F' ? 'Female' : 'Male',
+        student.result,
+        Number(student._pct.toFixed(2)),
+        (student._used || []).join(', '),
+        student.subjects.map(subject => `${subject.code}:${subject.grade === 'AB' ? 'AB' : subject.marks}`).join(' | ')
+      ]);
+    });
+    const meritSheet = XLSX.utils.aoa_to_sheet(meritRows);
+    meritSheet['!cols'] = [
+      {wch:8},{wch:28},{wch:28},{wch:14},{wch:8},{wch:8},{wch:14},{wch:10},{wch:10},{wch:10},{wch:18},{wch:48}
+    ];
+    XLSX.utils.book_append_sheet(wb, meritSheet, 'Combined Merit');
+  }
+
+  const comboName = workspaceState.activeCombinationId
+    ? (savedCombinations.find(combo => combo.id === workspaceState.activeCombinationId)?.name || 'Combination')
+    : 'Workspace';
+  XLSX.writeFile(
+    wb,
+    `CBSE_Multischool_${comboName.replace(/\s+/g, '_')}_${workspaceState.classScope}_${workspaceState.comparisonYear}.xlsx`
+  );
+}
+
 function exportExcel(){
+  if(isMultiMode()){
+    exportMultischoolWorkbook();
+    return;
+  }
   const meta = parseMeta(raw.X || raw.XII || '');
   const wb   = XLSX.utils.book_new();
 
