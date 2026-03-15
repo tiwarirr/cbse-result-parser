@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CBSE Result Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@300;400;500&family=Nunito:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header>
+  <div class="hbrand">
+    <div class="hlogo">S</div>
+    <div>
+      <div class="htitle">CBSE Result Dashboard</div>
+      <div class="hsub" id="hschool">CBSE School Result Analyser</div>
+    </div>
+  </div>
+  <div class="hright">
+    <div class="hmeta" id="hmeta">Upload result files to begin</div>
+    <button class="btn-backup" id="btn-backup" onclick="exportBackup()" style="display:none">Backup</button>
+    <button class="btn-restore-json" id="btn-restore-json" onclick="document.getElementById('import-file-input').click()">Restore Backup</button>
+    <input type="file" id="import-file-input" accept=".json" style="display:none" onchange="handleImportFile(event)">
+    <button class="btn-clear" id="btn-clear" onclick="clearSavedData()" style="display:none">Clear Saved</button>
+    <button class="btn-export" id="btn-export" onclick="exportExcel()">Export Excel</button>
+  </div>
+</header>
+
+<div id="import-overlay">
+  <div id="import-box">
+    <h2 id="import-title">Restore Data</h2>
+    <p id="import-desc">Select a saved session to restore.</p>
+    <div id="import-sessions"></div>
+    <div class="import-actions">
+      <button class="import-btn-cancel" onclick="closeImportOverlay()">Cancel</button>
+      <button class="import-btn-load" id="import-btn-load" onclick="doImport()" disabled>Load Selected</button>
+    </div>
+  </div>
+</div>
+
+<div class="restore-banner" id="restore-banner">
+  <span id="restore-msg">Data restored from saved session</span>
+  <button onclick="document.getElementById('restore-banner').classList.remove('show')">Dismiss</button>
+</div>
+
+<div class="parse-banner" id="parse-banner">
+  <div class="parse-banner-inner">
+    <div class="parse-banner-title">Parse warnings detected</div>
+    <div class="parse-banner-body" id="parse-banner-body"></div>
+  </div>
+</div>
+
+<div id="upload-screen">
+  <div class="upload-hero">
+    <h1>CBSE Gazette<br><em style="color:var(--gold-dk)">Result Analyser</em></h1>
+    <p>Upload Class X and / or Class XII gazette <code>.TXT</code> files.<br>
+    Both classes are kept <strong>fully separate</strong> throughout.<br>
+    Everything runs locally in your browser - no data is uploaded.</p>
+  </div>
+  <div class="upload-grid">
+    <div class="upload-card" id="card-X"
+      ondragover="dragOver(event,'X')" ondragleave="dragLeave(event,'X')" ondrop="fileDrop(event,'X')">
+      <input type="file" accept=".txt,.TXT" onchange="handleFile(event,'X')">
+      <span class="upload-icon">X</span>
+      <div class="upload-label">Class X</div>
+      <div class="upload-hint">Secondary Examination<br>Gazette TXT file</div>
+      <div class="upload-status" id="status-X"></div>
+    </div>
+    <div class="upload-card" id="card-XII"
+      ondragover="dragOver(event,'XII')" ondragleave="dragLeave(event,'XII')" ondrop="fileDrop(event,'XII')">
+      <input type="file" accept=".txt,.TXT" onchange="handleFile(event,'XII')">
+      <span class="upload-icon">XII</span>
+      <div class="upload-label">Class XII</div>
+      <div class="upload-hint">Senior School Certificate<br>Gazette TXT file</div>
+      <div class="upload-status" id="status-XII"></div>
+    </div>
+  </div>
+  <button class="btn-analyze" id="btn-analyze" onclick="runAnalysis()" disabled>Analyse Results</button>
+</div>
+
+<div id="dashboard">
+  <div class="class-tabs" id="class-tabs"></div>
+
+  <div class="sec-tabs">
+    <button class="stab active" onclick="showSec('summary',this)">Summary</button>
+    <button class="stab" onclick="showSec('subjects',this)">Subjects</button>
+    <button class="stab" onclick="showSec('merit',this)">Merit List</button>
+    <button class="stab" onclick="showSec('gender',this)">Gender</button>
+    <button class="stab" onclick="showSec('students',this)">All Students</button>
+  </div>
+
+  <div class="sec-tabs-mobile">
+    <select id="sec-select-mobile" onchange="showSec(this.value,null)">
+      <option value="summary">Summary</option>
+      <option value="subjects">Subjects</option>
+      <option value="merit">Merit List</option>
+      <option value="gender">Gender</option>
+      <option value="students">All Students</option>
+    </select>
+  </div>
+
+  <div class="content">
+    <div class="sec-panel active" id="sec-summary"><div id="d-summary"></div></div>
+    <div class="sec-panel" id="sec-subjects"><div id="d-subjects"></div></div>
+    <div class="sec-panel" id="sec-merit"><div id="d-merit"></div></div>
+    <div class="sec-panel" id="sec-gender"><div id="d-gender"></div></div>
+    <div class="sec-panel" id="sec-students"><div id="d-students"></div></div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
