@@ -1,0 +1,13 @@
+class,section,subjectCode,subjectName,teacherName,department,teacherId
+X,A,184,English Lang. & Lit.,Ms Kavita Sharma,English,T101
+X,A,041,Mathematics (Standard),Mr Rahul Verma,Mathematics,T102
+X,A,086,Science,Ms Preeti Singh,Science,T103
+X,A,087,Social Science,Mr Manoj Kumar,Social Science,T104
+X,B,184,English Lang. & Lit.,Ms Kavita Sharma,English,T101
+XII,A,301,English Core,Ms Kavita Sharma,English,T101
+XII,A,042,Physics,Dr Anil Gupta,Science,T201
+XII,A,043,Chemistry,Dr Ritu Sinha,Science,T202
+XII,A,041,Mathematics,Mr Rahul Verma,Mathematics,T102
+XII,B,054,Business Studies,Ms Nidhi Agarwal,Commerce,T301
+XII,B,055,Accountancy,Mr Saurabh Jain,Commerce,T302
+XII,B,030,Economics,Ms Shalini Gupta,Commerce,T303

@@ -93,6 +93,8 @@
 </div>
 
 <div id="dashboard">
+  <input type="file" id="student-master-input" accept=".xlsx,.xls,.csv" style="display:none" onchange="handleMasterFile(event,'student')">
+  <input type="file" id="teacher-mapping-input" accept=".xlsx,.xls,.csv" style="display:none" onchange="handleMasterFile(event,'teacher')">
   <div class="workspace-panel">
     <div class="workspace-top">
       <div>
@@ -109,7 +111,13 @@
         </div>
       </div>
       <div class="workspace-actions">
+        <button class="btn-restore-json workspace-btn" onclick="document.getElementById('student-master-input').click()" style="display:inline-block">Upload Student Master</button>
+        <button class="btn-restore-json workspace-btn" onclick="document.getElementById('teacher-mapping-input').click()" style="display:inline-block">Upload Teacher Mapping</button>
         <button class="btn-export workspace-btn" onclick="promptSaveCombination()" style="display:inline-block">Save Combination</button>
+        <div class="template-links">
+          <a class="template-link" href="student_master_template.csv" download>Student Master Example</a>
+          <a class="template-link" href="teacher_mapping_template.csv" download>Teacher Mapping Example</a>
+        </div>
       </div>
     </div>
     <div class="workspace-filters">
@@ -162,6 +170,9 @@
     <button class="stab" onclick="showSec('merit',this)">Merit List</button>
     <button class="stab" onclick="showSec('gender',this)">Gender</button>
     <button class="stab" onclick="showSec('students',this)">All Students</button>
+    <button class="stab" onclick="showSec('sections',this)">Section Review</button>
+    <button class="stab" onclick="showSec('teachers',this)">Teacher Review</button>
+    <button class="stab" onclick="showSec('followup',this)">Follow-Up</button>
   </div>
 
   <div class="sec-tabs-mobile">
@@ -171,6 +182,9 @@
       <option value="merit">Merit List</option>
       <option value="gender">Gender</option>
       <option value="students">All Students</option>
+      <option value="sections">Section Review</option>
+      <option value="teachers">Teacher Review</option>
+      <option value="followup">Follow-Up</option>
     </select>
   </div>
 
@@ -180,6 +194,9 @@
     <div class="sec-panel" id="sec-merit"><div id="d-merit"></div></div>
     <div class="sec-panel" id="sec-gender"><div id="d-gender"></div></div>
     <div class="sec-panel" id="sec-students"><div id="d-students"></div></div>
+    <div class="sec-panel" id="sec-sections"><div id="d-sections"></div></div>
+    <div class="sec-panel" id="sec-teachers"><div id="d-teachers"></div></div>
+    <div class="sec-panel" id="sec-followup"><div id="d-followup"></div></div>
   </div>
 </div>
 

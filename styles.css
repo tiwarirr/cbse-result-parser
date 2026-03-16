@@ -581,9 +581,113 @@ header {
   display:flex;
   gap:10px;
   flex-wrap:wrap;
+  justify-content:flex-end;
 }
 .workspace-btn {
   display:inline-block;
+}
+.template-links {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  width:100%;
+  justify-content:flex-end;
+}
+.template-link {
+  display:inline-flex;
+  align-items:center;
+  padding:7px 12px;
+  border-radius:999px;
+  border:1px solid #e5d8c5;
+  background:#fffaf2;
+  color:#8f6d3c;
+  font-size:12px;
+  font-weight:800;
+  text-decoration:none;
+  letter-spacing:.02em;
+}
+.template-link:hover {
+  background:#f8eddc;
+}
+.master-status {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:12px;
+}
+.master-chip {
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:6px 10px;
+  border-radius:999px;
+  font-size:11px;
+  font-weight:800;
+  letter-spacing:.04em;
+  text-transform:uppercase;
+  background:#f6efe5;
+  color:#7a6248;
+  border:1px solid #eadfce;
+}
+.master-chip strong {
+  font-family:'DM Mono',monospace;
+  font-size:12px;
+}
+.review-note {
+  margin-bottom:14px;
+  padding:12px 14px;
+  border-radius:14px;
+  background:#f9f5ee;
+  border:1px solid #eadfce;
+  color:#735e4a;
+  font-size:13px;
+}
+.review-controls {
+  display:flex;
+  flex-wrap:wrap;
+  gap:12px;
+  align-items:flex-end;
+  margin-bottom:14px;
+}
+.review-field label {
+  display:block;
+  margin-bottom:6px;
+  font-size:11px;
+  font-weight:800;
+  text-transform:uppercase;
+  letter-spacing:.08em;
+  color:#999;
+}
+.followup-input {
+  width:100%;
+  padding:8px 10px;
+  border-radius:10px;
+  border:1px solid #e2d8ca;
+  background:#fffdfa;
+  font:inherit;
+}
+.followup-input.small {
+  width:160px;
+}
+.followup-tag {
+  display:inline-flex;
+  align-items:center;
+  padding:4px 8px;
+  border-radius:999px;
+  font-size:11px;
+  font-weight:800;
+  letter-spacing:.04em;
+  background:#f3ece3;
+  color:#7c644c;
+  margin:2px 4px 2px 0;
+}
+.subject-drilled-row {
+  background:#f6e7bf;
+}
+.subject-drilled-row td {
+  background:#fdf1cc !important;
+  border-top:2px solid #dfbf73 !important;
+  border-bottom:2px solid #dfbf73 !important;
 }
 .workspace-filters {
   display:grid;

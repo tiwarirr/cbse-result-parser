@@ -100,6 +100,9 @@ const workspaceState = {
   activeCombinationId: null,
 };
 const COMBO_STORAGE_KEY = 'CBSE-MULTI-COMBINATIONS';
+const STUDENT_MASTER_SUFFIX = 'STUDENTMASTER';
+const TEACHER_MAPPING_SUFFIX = 'TEACHERMAPPING';
+const FOLLOW_UP_SUFFIX = 'FOLLOWUP';
 
 /*
  * Shared student record contract used by renderers and exports:
@@ -110,8 +113,24 @@ function createStudentRecord({rollNo, gender, name, result, cls, compSub, subjec
   return {rollNo, gender, name, result, cls, compSub, subjects};
 }
 
+function createEmptyMasterData(){
+  return {
+    studentMaster: [],
+    teacherMappings: [],
+    followUps: {},
+    diagnostics: {
+      studentMaster: {rows:0, matched:0, unmapped:0},
+      teacherMappings: {rows:0, matched:0, unmapped:0},
+    }
+  };
+}
+
 function createSessionId(schoolCode, year){
   return `${schoolCode || 'CBSE'}-${year || new Date().getFullYear()}`;
+}
+
+function getSessionStorageKey(session, suffix){
+  return `${session.schoolCode}-${session.year}-${suffix}`;
 }
 
 function getSessionLabel(session){
@@ -197,6 +216,14 @@ async function updateStorageIndicator(){
     : pctUsed > 60
       ? 'linear-gradient(90deg, #d7a63a 0%, #cf7e22 100%)'
       : 'linear-gradient(90deg, #c9a84c 0%, #d48b1f 100%)';
+}
+
+function escapeAttr(value){
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 function createParseDiagnostics(cls){
@@ -375,6 +402,7 @@ function buildSessionFromRawClasses(classes){
     schoolCode,
     schoolName: meta.school || schoolCode,
     year,
+    masterData: createEmptyMasterData(),
     parsed: {
       X: classX ? classX.students.length : 0,
       XII: classXII ? classXII.students.length : 0,
@@ -396,6 +424,7 @@ function mergeSessionIntoRegistry(session){
     schoolSessions[session.sessionId] = {
       ...existing,
       schoolName: session.schoolName || existing.schoolName,
+      masterData: session.masterData || existing.masterData || createEmptyMasterData(),
       parsed: {
         X: session.classes.X ? session.classes.X.students.length : (existing.classes.X ? existing.classes.X.students.length : 0),
         XII: session.classes.XII ? session.classes.XII.students.length : (existing.classes.XII ? existing.classes.XII.students.length : 0),
@@ -410,7 +439,10 @@ function mergeSessionIntoRegistry(session){
       }
     };
   } else {
-    schoolSessions[session.sessionId] = session;
+    schoolSessions[session.sessionId] = {
+      ...session,
+      masterData: session.masterData || createEmptyMasterData(),
+    };
   }
   return schoolSessions[session.sessionId];
 }
@@ -458,6 +490,30 @@ function persistSchoolSession(session){
   });
 }
 
+function loadSessionMasterData(session){
+  const fallback = createEmptyMasterData();
+  try {
+    const studentMaster = JSON.parse(localStorage.getItem(getSessionStorageKey(session, STUDENT_MASTER_SUFFIX)) || '[]');
+    const teacherMappings = JSON.parse(localStorage.getItem(getSessionStorageKey(session, TEACHER_MAPPING_SUFFIX)) || '[]');
+    const followUps = JSON.parse(localStorage.getItem(getSessionStorageKey(session, FOLLOW_UP_SUFFIX)) || '{}');
+    return {
+      ...fallback,
+      studentMaster: Array.isArray(studentMaster) ? studentMaster : [],
+      teacherMappings: Array.isArray(teacherMappings) ? teacherMappings : [],
+      followUps: followUps && typeof followUps === 'object' ? followUps : {},
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function persistMasterData(session){
+  const masterData = session.masterData || createEmptyMasterData();
+  localStorage.setItem(getSessionStorageKey(session, STUDENT_MASTER_SUFFIX), JSON.stringify(masterData.studentMaster || []));
+  localStorage.setItem(getSessionStorageKey(session, TEACHER_MAPPING_SUFFIX), JSON.stringify(masterData.teacherMappings || []));
+  localStorage.setItem(getSessionStorageKey(session, FOLLOW_UP_SUFFIX), JSON.stringify(masterData.followUps || {}));
+}
+
 function rebuildSessionsFromLocalStorage(){
   Object.keys(schoolSessions).forEach(key => delete schoolSessions[key]);
   const pattern = /^(.+)-(\d{4})-(X|XII)$/;
@@ -473,9 +529,175 @@ function rebuildSessionsFromLocalStorage(){
   }
   Object.entries(grouped).forEach(([, classes]) => {
     const session = buildSessionFromRawClasses(classes);
-    mergeSessionIntoRegistry(session);
+    const merged = mergeSessionIntoRegistry(session);
+    merged.masterData = loadSessionMasterData(merged);
   });
   savedCombinations = collectSavedCombinations();
+}
+
+function normalizeHeaderName(value){
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function normalizeClassValue(value){
+  const rawValue = String(value || '').trim().toUpperCase();
+  const compact = rawValue.replace(/[^A-Z0-9]/g, '');
+  if(compact === '10' || compact === 'X' || compact === 'CLASSX' || compact === 'CLASS10') return 'X';
+  if(compact === '12' || compact === 'XII' || compact === 'CLASSXII' || compact === 'CLASS12') return 'XII';
+  return rawValue;
+}
+
+function normalizeSectionValue(value){
+  return String(value || '').trim().toUpperCase();
+}
+
+function normalizeRollValue(value){
+  const digits = String(value || '').replace(/\D/g, '');
+  return digits || String(value || '').trim();
+}
+
+function pickRowValue(row, aliases){
+  for(const alias of aliases){
+    const key = Object.keys(row).find(item => normalizeHeaderName(item) === alias);
+    if(key && row[key] !== undefined && row[key] !== null && String(row[key]).trim() !== '') return row[key];
+  }
+  return '';
+}
+
+function mapStudentMasterRows(rows){
+  return rows.map(row => ({
+    rollNo: normalizeRollValue(pickRowValue(row, ['rollno','rollnumber','admissionno'])),
+    class: normalizeClassValue(pickRowValue(row, ['class','cls'])),
+    section: normalizeSectionValue(pickRowValue(row, ['section','sec'])),
+    classTeacher: String(pickRowValue(row, ['classteacher','classteachername','teacher']) || '').trim(),
+    stream: String(pickRowValue(row, ['stream']) || '').trim(),
+    house: String(pickRowValue(row, ['house']) || '').trim(),
+  })).filter(row => row.rollNo && row.class && row.section);
+}
+
+function mapTeacherRows(rows){
+  return rows.map(row => ({
+    class: normalizeClassValue(pickRowValue(row, ['class','cls'])),
+    section: normalizeSectionValue(pickRowValue(row, ['section','sec'])),
+    subjectCode: String(pickRowValue(row, ['subjectcode','subcode','code']) || '').trim().padStart(3, '0'),
+    subjectName: String(pickRowValue(row, ['subjectname','subject']) || '').trim(),
+    teacherName: String(pickRowValue(row, ['teachername','teacher']) || '').trim(),
+    department: String(pickRowValue(row, ['department','dept']) || '').trim(),
+    teacherId: String(pickRowValue(row, ['teacherid','staffid','employeeid']) || '').trim(),
+  })).filter(row => row.class && row.section && row.subjectCode && row.teacherName);
+}
+
+function readWorkbookRows(file){
+  return file.arrayBuffer().then(buffer => {
+    const workbook = XLSX.read(buffer, {type:'array'});
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    return XLSX.utils.sheet_to_json(sheet, {defval:''});
+  });
+}
+
+function getCurrentSingleSession(){
+  return activeSessionId ? schoolSessions[activeSessionId] : null;
+}
+
+function buildEnrichedStudents(cls){
+  const session = getCurrentSingleSession();
+  if(!session || !session.classes[cls]) return {students: [], diagnostics: createEmptyMasterData().diagnostics};
+
+  const masterData = session.masterData || createEmptyMasterData();
+  const studentMap = new Map(
+    (masterData.studentMaster || []).map(row => [`${row.rollNo}|${row.class}`, row])
+  );
+  const teacherMap = new Map(
+    (masterData.teacherMappings || []).map(row => [`${row.class}|${row.section}|${row.subjectCode}`, row])
+  );
+
+  const diagnostics = {
+    studentMaster: {rows: masterData.studentMaster.length, matched: 0, unmapped: 0},
+    teacherMappings: {rows: masterData.teacherMappings.length, matched: 0, unmapped: 0},
+  };
+
+  const students = DB[cls].map(student => {
+    const studentMaster = studentMap.get(`${student.rollNo}|${student.cls}`) || null;
+    if(studentMaster) diagnostics.studentMaster.matched += 1;
+    else diagnostics.studentMaster.unmapped += 1;
+
+    const section = studentMaster?.section || 'UNMAPPED';
+    const subjects = student.subjects.map(subject => {
+      const teacherRow = teacherMap.get(`${student.cls}|${section}|${subject.code}`) || null;
+      if(teacherRow) diagnostics.teacherMappings.matched += 1;
+      else diagnostics.teacherMappings.unmapped += 1;
+      return {
+        ...subject,
+        teacherName: teacherRow?.teacherName || 'Unmapped',
+        teacherId: teacherRow?.teacherId || '',
+        department: teacherRow?.department || '',
+        mappedSubjectName: teacherRow?.subjectName || subject.name,
+      };
+    });
+
+    return {
+      ...student,
+      section,
+      classTeacher: studentMaster?.classTeacher || 'Unmapped',
+      stream: studentMaster?.stream || '',
+      house: studentMaster?.house || '',
+      schoolCode: session.schoolCode,
+      schoolName: session.schoolName,
+      year: session.year,
+      subjects,
+    };
+  });
+
+  session.masterData.diagnostics = diagnostics;
+  return {students, diagnostics};
+}
+
+function handleMasterFile(e, type){
+  const file = e.target.files[0];
+  e.target.value = '';
+  const session = getCurrentSingleSession();
+  if(!file || !session){
+    alert('Open a single school session before uploading school master data.');
+    return;
+  }
+
+  readWorkbookRows(file).then(rows => {
+    const masterData = session.masterData || createEmptyMasterData();
+    if(type === 'student'){
+      masterData.studentMaster = mapStudentMasterRows(rows);
+      alert(`Student master loaded: ${masterData.studentMaster.length} valid row(s).`);
+    } else {
+      masterData.teacherMappings = mapTeacherRows(rows);
+      alert(`Teacher mapping loaded: ${masterData.teacherMappings.length} valid row(s).`);
+    }
+    session.masterData = masterData;
+    persistMasterData(session);
+    renderWorkspacePanel();
+    renderSec();
+  }).catch(() => {
+    alert('Could not read the uploaded file. Please use CSV or Excel with header columns.');
+  });
+}
+
+function getFollowUpCategories(student){
+  const categories = [];
+  if(student.result === 'COMP') categories.push('Compartment');
+  const weakSubjects = student.subjects.filter(subject => subject.grade === 'E');
+  if(weakSubjects.length) categories.push('Grade E');
+  return {categories, weakSubjects};
+}
+
+function updateFollowUpRecord(cls, rollNo, field, value){
+  const session = getCurrentSingleSession();
+  if(!session) return;
+  const key = `${cls}|${rollNo}`;
+  const followUps = session.masterData.followUps || {};
+  followUps[key] = {
+    ...(followUps[key] || {}),
+    [field]: value,
+  };
+  session.masterData.followUps = followUps;
+  persistMasterData(session);
 }
 
 function renderParseWarnings(){
@@ -564,6 +786,9 @@ function clearSavedData(){
   const sessions = getActiveSessions();
   sessions.forEach(session => {
     ['X','XII'].forEach(cls => localStorage.removeItem(`${session.schoolCode}-${session.year}-${cls}`));
+    [STUDENT_MASTER_SUFFIX, TEACHER_MAPPING_SUFFIX, FOLLOW_UP_SUFFIX].forEach(suffix =>
+      localStorage.removeItem(getSessionStorageKey(session, suffix))
+    );
   });
   const removedIds = new Set(sessions.map(session => session.sessionId));
   savedCombinations = savedCombinations.filter(combo =>
@@ -601,7 +826,16 @@ function exportBackup(){
         ...(session.classes.XII ? {XII: session.classes.XII.rawText} : {}),
       }
     })),
-    combinations: savedCombinations
+    combinations: savedCombinations,
+    studentMasters: sessions
+      .filter(session => session.masterData?.studentMaster?.length)
+      .map(session => ({schoolCode: session.schoolCode, year: session.year, rows: session.masterData.studentMaster})),
+    teacherMappings: sessions
+      .filter(session => session.masterData?.teacherMappings?.length)
+      .map(session => ({schoolCode: session.schoolCode, year: session.year, rows: session.masterData.teacherMappings})),
+    followUps: sessions
+      .filter(session => session.masterData?.followUps && Object.keys(session.masterData.followUps).length)
+      .map(session => ({schoolCode: session.schoolCode, year: session.year, rows: session.masterData.followUps}))
   };
 
   const blob = new Blob([JSON.stringify(backup, null, 2)], {type:'application/json'});
@@ -648,9 +882,18 @@ function renderWorkspacePanel(){
   const comboList = document.getElementById('combination-list');
   const workspaceSub = document.getElementById('workspace-sub');
   const selectedCount = getActiveSessions().length;
+  const session = getCurrentSingleSession();
+  const masterData = session?.masterData || createEmptyMasterData();
   workspaceSub.textContent = selectedCount
     ? `${selectedCount} school${selectedCount > 1 ? 's' : ''} selected. Use Multi-School mode for comparison and combined merit.`
     : 'Upload or restore schools to start a multischool workspace.';
+  if(session && !isMultiMode()){
+    workspaceSub.innerHTML += `<div class="master-status">
+      <span class="master-chip">Student Master <strong>${masterData.studentMaster.length}</strong></span>
+      <span class="master-chip">Teacher Mapping <strong>${masterData.teacherMappings.length}</strong></span>
+      <span class="master-chip">Follow-Up Notes <strong>${Object.keys(masterData.followUps || {}).length}</strong></span>
+    </div>`;
+  }
 
   sessionList.innerHTML = sessions.length ? sessions.map(session => {
     const selected = workspaceState.selectedSessionIds.includes(session.sessionId);
@@ -874,6 +1117,7 @@ function handleImportFile(e){
     openSessionOverlay({
       mode:'backup',
       items,
+      payload:data,
       title:'Restore from Backup',
       description:`${items.length} saved item${items.length > 1 ? 's' : ''} found in this backup.${dateText} Select one to load.`,
       buttonLabel:'Load Selected'
@@ -928,6 +1172,18 @@ function doImport(){
       Object.entries(item.classes).forEach(([cls, text]) => {
         localStorage.setItem(`${item.schoolCode}-${item.year}-${cls}`, text);
       });
+      const studentMaster = (overlayState.payload?.studentMasters || []).find(entry =>
+        entry.schoolCode === item.schoolCode && String(entry.year) === String(item.year)
+      );
+      const teacherMapping = (overlayState.payload?.teacherMappings || []).find(entry =>
+        entry.schoolCode === item.schoolCode && String(entry.year) === String(item.year)
+      );
+      const followUps = (overlayState.payload?.followUps || []).find(entry =>
+        entry.schoolCode === item.schoolCode && String(entry.year) === String(item.year)
+      );
+      if(studentMaster) localStorage.setItem(`${item.schoolCode}-${item.year}-${STUDENT_MASTER_SUFFIX}`, JSON.stringify(studentMaster.rows || []));
+      if(teacherMapping) localStorage.setItem(`${item.schoolCode}-${item.year}-${TEACHER_MAPPING_SUFFIX}`, JSON.stringify(teacherMapping.rows || []));
+      if(followUps) localStorage.setItem(`${item.schoolCode}-${item.year}-${FOLLOW_UP_SUFFIX}`, JSON.stringify(followUps.rows || {}));
       rebuildSessionsFromLocalStorage();
       closeImportOverlay();
       restoreSession(item, 'Data restored from backup');
@@ -1029,7 +1285,7 @@ function renderSec(){
   if(isMultiMode()){
     if(activeSec==='summary')  renderMultischoolSummary();
     if(activeSec==='merit')    renderCombinedMerit();
-    if(activeSec==='subjects' || activeSec==='gender' || activeSec==='students'){
+    if(activeSec==='subjects' || activeSec==='gender' || activeSec==='students' || activeSec==='sections' || activeSec==='teachers' || activeSec==='followup'){
       renderMultiPlaceholder(activeSec);
     }
     return;
@@ -1040,6 +1296,9 @@ function renderSec(){
   if(activeSec==='merit')    renderMerit(activeCls);
   if(activeSec==='gender')   renderGender(activeCls);
   if(activeSec==='students') renderStudents(activeCls);
+  if(activeSec==='sections') renderSectionReview(activeCls);
+  if(activeSec==='teachers') renderTeacherReview(activeCls);
+  if(activeSec==='followup') renderFollowUp(activeCls);
   if(activeSec==='search')   doSearch();
 }
 
@@ -1120,9 +1379,20 @@ function renderMultiPlaceholder(section){
   const titles = {
     subjects: 'Subject analysis remains school-specific in this release.',
     gender: 'Gender analysis remains school-specific in this release.',
-    students: 'The all students table remains school-specific in this release.'
+    students: 'The all students table remains school-specific in this release.',
+    sections: 'Section review is available in single-school mode after student master upload.',
+    teachers: 'Teacher review is available in single-school mode after teacher mapping upload.',
+    followup: 'Follow-up tracking is available in single-school mode.'
   };
-  const target = section === 'subjects' ? 'd-subjects' : section === 'gender' ? 'd-gender' : 'd-students';
+  const targetMap = {
+    subjects: 'd-subjects',
+    gender: 'd-gender',
+    students: 'd-students',
+    sections: 'd-sections',
+    teachers: 'd-teachers',
+    followup: 'd-followup',
+  };
+  const target = targetMap[section];
   document.getElementById(target).innerHTML = `<div class="compare-note">${titles[section]} Open one school to use this tab, or use Summary and Merit for multischool comparison.</div>`;
 }
 
@@ -1555,6 +1825,206 @@ function renderSubjects(cls){
 ══════════════════════════════════════════════════════════════ */
 
 // Auto-detect English subject code for a class
+function renderSubjects(cls){
+  const sts = DB[cls];
+  if(!sts.length){document.getElementById('d-subjects').innerHTML=nodata();return;}
+  const {students: enrichedStudents} = buildEnrichedStudents(cls);
+  const showTeacherDetail = !!subjectViewState[cls]?.showTeacherDetail;
+
+  const sm = {};
+  const buckets = ['<=40','41-50','51-60','61-70','71-80','81-90','91-94','95-100'];
+  function getBucket(m){
+    if(m<=40) return '<=40';
+    if(m<=50) return '41-50';
+    if(m<=60) return '51-60';
+    if(m<=70) return '61-70';
+    if(m<=80) return '71-80';
+    if(m<=90) return '81-90';
+    if(m<=94) return '91-94';
+    return '95-100';
+  }
+
+  sts.forEach(student => student.subjects.forEach(subject => {
+    if(!sm[subject.code]) sm[subject.code] = {code:subject.code, name:subject.name, marks:[], pass:0, n:0, abs:0, mb:{}};
+    const entry = sm[subject.code];
+    if(subject.grade !== 'AB'){
+      entry.marks.push(subject.marks);
+      entry.n++;
+      entry.mb[getBucket(subject.marks)] = (entry.mb[getBucket(subject.marks)] || 0) + 1;
+      if(subject.grade !== 'E') entry.pass++;
+    } else {
+      entry.abs++;
+    }
+  }));
+  const subs = Object.values(sm).filter(subject => (subject.marks.length + subject.abs) > 0).sort((a,b) => avg(b.marks) - avg(a.marks));
+
+  const teacherDetails = {};
+  enrichedStudents.forEach(student => {
+    student.subjects.forEach(subject => {
+      if(!teacherDetails[subject.code]) teacherDetails[subject.code] = {};
+      const key = `${subject.teacherName || 'Unmapped'}|${student.section || 'UNMAPPED'}`;
+      if(!teacherDetails[subject.code][key]){
+        teacherDetails[subject.code][key] = {
+          teacherName: subject.teacherName || 'Unmapped',
+          section: student.section || 'UNMAPPED',
+          taught: 0,
+          total: 0,
+          pass: 0,
+          fail: 0,
+          absent: 0,
+          marks: [],
+          mb: {},
+        };
+      }
+      const row = teacherDetails[subject.code][key];
+      row.total += 1;
+      if(subject.grade === 'AB') row.absent += 1;
+      else {
+        row.taught += 1;
+        row.marks.push(subject.marks);
+        if(subject.grade === 'E') row.fail += 1;
+        else row.pass += 1;
+        row.mb[getBucket(subject.marks)] = (row.mb[getBucket(subject.marks)] || 0) + 1;
+      }
+    });
+  });
+
+  document.getElementById('d-subjects').innerHTML = `
+    <div class="sec-h">
+      <div class="sec-title">Subject Performance - Class ${cls}</div>
+      <div class="sec-sub">Average marks, highest score and pass % per subject · ${sts.length} students</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Average Marks by Subject - Class ${cls}</div>
+      <div class="cwrap-lg"><canvas id="c-subavg-${cls}"></canvas></div>
+    </div>
+    <div class="card" style="max-width:100%;overflow-x:auto;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px">
+        <div class="card-title" style="margin-bottom:0">Detailed Marks Breakdown Table - Class ${cls}</div>
+        <button class="btn-restore-json workspace-btn" onclick="toggleSubjectTeacherDetail('${cls}')" style="display:inline-block;padding:8px 14px">
+          ${showTeacherDetail ? 'Hide Teacher Detail' : 'Show Teacher Detail'}
+        </button>
+      </div>
+      <div class="tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th rowspan="2" style="white-space:nowrap">Subject</th>
+              <th rowspan="2" style="white-space:nowrap">Code</th>
+              <th rowspan="2" style="white-space:nowrap">TOTAL</th>
+              <th rowspan="2" style="white-space:nowrap">ABS</th>
+              <th rowspan="2" style="white-space:nowrap">APP</th>
+              <th rowspan="2" style="white-space:nowrap">"E"(FAIL)</th>
+              <th rowspan="2" style="white-space:nowrap">PASS</th>
+              <th rowspan="2" style="white-space:nowrap">PASS%</th>
+              <th rowspan="2" style="white-space:nowrap">AVG</th>
+              <th rowspan="2" style="white-space:nowrap">MAX</th>
+              <th rowspan="2" style="white-space:nowrap">MIN</th>
+              <th colspan="8" style="text-align:center;background:var(--paper);color:#888;font-size:11px;letter-spacing:.06em">MARKS DISTRIBUTION</th>
+            </tr>
+            <tr>${buckets.map(bucket => `<th style="white-space:nowrap;font-size:11px;text-align:center;padding:4px 6px">${bucket}</th>`).join('')}</tr>
+          </thead>
+          <tbody>${subs.map(subject => {
+            const total = subject.n + subject.abs;
+            const avgMarks = subject.n ? avg(subject.marks).toFixed(1) : '0.0';
+            const maxMarks = subject.n ? Math.max(...subject.marks) : 0;
+            const minMarks = subject.n ? Math.min(...subject.marks) : 0;
+            const fail = subject.n - subject.pass;
+            const passPct = subject.n ? pct(subject.pass, subject.n) : '0.0';
+            const ppColor = parseFloat(passPct) >= 90 ? 'var(--green)' : parseFloat(passPct) >= 75 ? '#1a7a8a' : parseFloat(passPct) >= 50 ? 'var(--amber)' : 'var(--red)';
+            const detailRows = Object.values(teacherDetails[subject.code] || {}).sort((a,b) => a.teacherName.localeCompare(b.teacherName) || a.section.localeCompare(b.section));
+            const rowHighlight = showTeacherDetail && detailRows.length
+              ? 'background:#fdf1cc;border-top:2px solid #dfbf73;border-bottom:2px solid #dfbf73;'
+              : '';
+            const detailHtml = showTeacherDetail && detailRows.length ? `<tr>
+              <td colspan="${11 + buckets.length}" style="padding:0;background:#fbf8f3">
+                <div style="padding:12px 16px">
+                  <div style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:#9a8f82;margin-bottom:8px">Teacher-Level Detail</div>
+                  <table style="width:100%">
+                    <thead>
+                      <tr>
+                        <th style="text-align:left">Teacher</th>
+                        <th style="text-align:left">Section</th>
+                        <th style="text-align:center">TOTAL</th>
+                        <th style="text-align:center">ABS</th>
+                        <th style="text-align:center">APP</th>
+                        <th style="text-align:center">Pass</th>
+                        <th style="text-align:center">"E"</th>
+                        <th style="text-align:center">Pass %</th>
+                        <th style="text-align:center">Avg</th>
+                        <th style="text-align:center">Max</th>
+                        <th style="text-align:center">Min</th>
+                        ${buckets.map(bucket => `<th style="text-align:center">${bucket}</th>`).join('')}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      ${detailRows.map(row => {
+                        const rowAvg = row.marks.length ? avg(row.marks).toFixed(1) : '0.0';
+                        const rowMax = row.marks.length ? Math.max(...row.marks) : 0;
+                        const rowMin = row.marks.length ? Math.min(...row.marks) : 0;
+                        const rowPassPct = row.taught ? ((row.pass / row.taught) * 100).toFixed(1) : '0.0';
+                        return `<tr>
+                          <td><strong>${row.teacherName}</strong></td>
+                          <td>${row.section}</td>
+                          <td style="text-align:center">${row.total}</td>
+                          <td style="text-align:center">${row.absent}</td>
+                          <td style="text-align:center">${row.taught}</td>
+                          <td style="text-align:center;color:var(--green);font-weight:700">${row.pass}</td>
+                          <td style="text-align:center;color:var(--red)">${row.fail}</td>
+                          <td style="text-align:center;font-family:'DM Mono',monospace">${rowPassPct}%</td>
+                          <td style="text-align:center;font-family:'DM Mono',monospace">${rowAvg}</td>
+                          <td style="text-align:center;font-family:'DM Mono',monospace">${rowMax}</td>
+                          <td style="text-align:center;font-family:'DM Mono',monospace">${rowMin}</td>
+                          ${buckets.map(bucket => {
+                            const count = row.mb[bucket] || 0;
+                            return `<td style="text-align:center;font-family:'DM Mono',monospace;${count > 0 ? 'font-weight:700' : 'color:#ddd'}">${count || '-'}</td>`;
+                          }).join('')}
+                        </tr>`;
+                      }).join('')}
+                    </tbody>
+                  </table>
+                </div>
+              </td>
+            </tr>` : '';
+            return `<tr class="${showTeacherDetail && detailRows.length ? 'subject-drilled-row' : ''}">
+              <td style="white-space:nowrap;${rowHighlight}"><strong>${subject.name}</strong></td>
+              <td style="font-family:'DM Mono',monospace;color:#bbb;font-size:12px;text-align:center;${rowHighlight}">${subject.code}</td>
+              <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${total}</td>
+              <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${subject.abs}</td>
+              <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${subject.n}</td>
+              <td style="font-family:'DM Mono',monospace;text-align:center;color:var(--red);${rowHighlight}">${fail}</td>
+              <td style="font-family:'DM Mono',monospace;text-align:center;color:var(--green);font-weight:700;${rowHighlight}">${subject.pass}</td>
+              <td style="font-family:'DM Mono',monospace;font-weight:700;text-align:center;color:${ppColor};${rowHighlight}">${passPct}%</td>
+              <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${avgMarks}</td>
+              <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${maxMarks}</td>
+              <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${minMarks}</td>
+              ${buckets.map(bucket => {
+                const count = subject.mb[bucket] || 0;
+                return `<td style="font-family:'DM Mono',monospace;font-size:12px;text-align:center;${count > 0 ? 'font-weight:700' : 'color:#ddd'};${rowHighlight}">${count || '-'}</td>`;
+              }).join('')}
+            </tr>${detailHtml}`;
+          }).join('')}</tbody>
+        </table>
+      </div>
+    </div>`;
+
+  const top = subs;
+  const chartH = Math.max(300, top.length * 32);
+  const canvasWrap = document.querySelector(`#c-subavg-${cls}`)?.parentElement;
+  if(canvasWrap) canvasWrap.style.height = chartH + 'px';
+  dc('c-subavg-'+cls);
+  charts['c-subavg-'+cls] = new Chart(document.getElementById('c-subavg-'+cls),{
+    type:'bar',
+    data:{labels:top.map(subject => subject.name.length > 22 ? subject.name.slice(0,20) + '...' : subject.name),
+      datasets:[{label:'Avg Marks',data:top.map(subject => parseFloat(avg(subject.marks).toFixed(1))),
+        backgroundColor:top.map((_,i)=>CC[cls].bar(i)),borderRadius:4}]},
+    options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
+      scales:{x:{ticks:{font:{family:'DM Mono'}},grid:{color:'#f0ede8'}},
+              y:{ticks:{font:{family:'Nunito',size:12}},grid:{display:false}}},
+      plugins:{legend:{display:false}}}
+  });
+}
+
 function detectEngCode(cls){
   const engCodes = cls==='XII'
     ? ['301','302','001','002','118','120']  // prefer 301=English Core
@@ -2042,6 +2512,7 @@ function renderStudents(cls){
 const sortState  = {};
 // current filtered+sorted pool per class — used by exportCurrentView
 const currentPool = {};
+const subjectViewState = {};
 
 function drawStudents(cls){
   const resF = document.getElementById('stf-res-'+cls)?.value || 'all';
@@ -2153,6 +2624,327 @@ function setSortStudents(cls, col){
   const cur = sortState[cls] || {col:'total', dir:-1};
   sortState[cls] = { col, dir: cur.col===col ? -cur.dir : -1 };
   drawStudents(cls);
+}
+
+function toggleSubjectTeacherDetail(cls){
+  subjectViewState[cls] = {
+    ...(subjectViewState[cls] || {}),
+    showTeacherDetail: !subjectViewState[cls]?.showTeacherDetail
+  };
+  renderSubjects(cls);
+}
+
+function getSortIndicator(key, col){
+  const state = sortState[key];
+  if(!state || state.col !== col) return ' <span style="opacity:.25">↕</span>';
+  return state.dir === -1 ? ' <span style="color:var(--gold-dk)">↓</span>' : ' <span style="color:var(--gold-dk)">↑</span>';
+}
+
+function sortHeader(key, col, label){
+  return `<span style="cursor:pointer;user-select:none;white-space:nowrap" onclick="setReviewSort('${key}','${col}')">${label}${getSortIndicator(key, col)}</span>`;
+}
+
+function setReviewSort(key, col){
+  const cur = sortState[key] || {col, dir:-1};
+  sortState[key] = {col, dir: cur.col === col ? -cur.dir : -1};
+  if(key.startsWith('section-review-')) renderSectionReview(key.replace('section-review-', ''));
+  if(key.startsWith('teacher-review-')) renderTeacherReview(key.replace('teacher-review-', ''));
+}
+
+function renderSectionReview(cls){
+  const {students, diagnostics} = buildEnrichedStudents(cls);
+  const target = document.getElementById('d-sections');
+  if(!students.length){
+    target.innerHTML = nodata();
+    return;
+  }
+
+  const groups = {};
+  students.forEach(student => {
+    const key = student.section || 'UNMAPPED';
+    if(!groups[key]) groups[key] = {section:key, classTeacher:student.classTeacher || 'Unmapped', students:[]};
+    groups[key].students.push(student);
+  });
+  let rows = Object.values(groups).map(group => {
+    const stats = st(group.students);
+    const topper = group.students
+      .filter(student => student.result === 'PASS' || student.result === 'COMP')
+      .sort((a,b) => tm(b) - tm(a))[0];
+    const weakMap = {};
+    group.students.forEach(student => {
+      student.subjects.forEach(subject => {
+        if(subject.grade === 'E' || (subject.grade !== 'AB' && subject.marks < 33)){
+          weakMap[subject.code] = weakMap[subject.code] || {name:subject.name, count:0};
+          weakMap[subject.code].count += 1;
+        }
+      });
+    });
+    const weakest = Object.values(weakMap).sort((a,b) => b.count - a.count).slice(0,2).map(item => `${item.name} (${item.count})`).join(', ') || 'None';
+    return {
+      ...group,
+      stats,
+      avgTotal: avg(group.students.filter(student => student.result === 'PASS').map(student => tm(student))).toFixed(1),
+      topper,
+      weakest,
+    };
+  });
+  const sortKey = `section-review-${cls}`;
+  const sectionSort = sortState[sortKey] || {col:'passPct', dir:-1};
+  rows = rows.sort((a,b) => {
+    const failA = a.stats.n - a.stats.pass - a.stats.comp - a.stats.abst;
+    const failB = b.stats.n - b.stats.pass - b.stats.comp - b.stats.abst;
+    const valueA = {
+      section: a.section,
+      classTeacher: a.classTeacher || '',
+      students: a.stats.n,
+      passPct: parseFloat(a.stats.pct),
+      comp: a.stats.comp,
+      fail: failA,
+      absent: a.stats.abst,
+      avgTotal: parseFloat(a.avgTotal),
+      topper: a.topper ? a.topper.name : '',
+      weakest: a.weakest,
+    }[sectionSort.col];
+    const valueB = {
+      section: b.section,
+      classTeacher: b.classTeacher || '',
+      students: b.stats.n,
+      passPct: parseFloat(b.stats.pct),
+      comp: b.stats.comp,
+      fail: failB,
+      absent: b.stats.abst,
+      avgTotal: parseFloat(b.avgTotal),
+      topper: b.topper ? b.topper.name : '',
+      weakest: b.weakest,
+    }[sectionSort.col];
+    if(typeof valueA === 'number' && typeof valueB === 'number') return sectionSort.dir * (valueA - valueB);
+    return sectionSort.dir * String(valueA).localeCompare(String(valueB));
+  });
+
+  target.innerHTML = `
+    <div class="sec-h">
+      <div class="sec-title">Section Review - Class ${cls}</div>
+      <div class="sec-sub">Board-result review by section and class teacher.</div>
+    </div>
+    <div class="review-note">
+      Student master rows: ${diagnostics.studentMaster.rows} | Matched students: ${diagnostics.studentMaster.matched} | Unmapped students: ${diagnostics.studentMaster.unmapped}
+    </div>
+    <div class="card">
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>${sortHeader(sortKey,'section','Section')}</th><th>${sortHeader(sortKey,'classTeacher','Class Teacher')}</th><th>${sortHeader(sortKey,'students','Students')}</th><th>${sortHeader(sortKey,'passPct','Pass %')}</th><th>${sortHeader(sortKey,'comp','Comp')}</th><th>${sortHeader(sortKey,'fail','Fail')}</th><th>${sortHeader(sortKey,'absent','Absent')}</th><th>${sortHeader(sortKey,'avgTotal','Avg Total')}</th><th>${sortHeader(sortKey,'topper','Topper')}</th><th>${sortHeader(sortKey,'weakest','Weakest Subjects')}</th></tr></thead>
+          <tbody>
+            ${rows.map(row => `
+              <tr>
+                <td><strong>${row.section}</strong></td>
+                <td>${row.classTeacher || 'Unmapped'}</td>
+                <td>${row.stats.n}</td>
+                <td style="font-family:'DM Mono',monospace;font-weight:700;color:var(--green)">${row.stats.pct}%</td>
+                <td>${row.stats.comp}</td>
+                <td>${row.stats.n - row.stats.pass - row.stats.comp - row.stats.abst}</td>
+                <td>${row.stats.abst}</td>
+                <td>${row.avgTotal}</td>
+                <td>${row.topper ? `${row.topper.name} (${tm(row.topper)})` : 'NA'}</td>
+                <td>${row.weakest}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+function renderTeacherReview(cls){
+  const {students, diagnostics} = buildEnrichedStudents(cls);
+  const target = document.getElementById('d-teachers');
+  if(!students.length){
+    target.innerHTML = nodata();
+    return;
+  }
+
+  const groups = {};
+  students.forEach(student => {
+    student.subjects.forEach(subject => {
+      const key = `${subject.teacherName}|${subject.code}|${student.section}`;
+      if(!groups[key]){
+        groups[key] = {
+          teacherName: subject.teacherName,
+          department: subject.department || '',
+          subjectCode: subject.code,
+          subjectName: subject.mappedSubjectName || subject.name,
+          section: student.section,
+          students: [],
+          marks: [],
+          passCount: 0,
+          absentCount: 0,
+          distinctionCount: 0,
+          lowCount: 0,
+        };
+      }
+      const group = groups[key];
+      group.students.push(student.rollNo);
+      if(subject.grade === 'AB') group.absentCount += 1;
+      else {
+        group.marks.push(subject.marks);
+        if(subject.grade !== 'E' && subject.marks >= 33) group.passCount += 1;
+        if(subject.marks >= 90) group.distinctionCount += 1;
+        if(subject.marks < 33) group.lowCount += 1;
+      }
+    });
+  });
+
+  const schoolSubjectAverages = {};
+  students.forEach(student => {
+    student.subjects.forEach(subject => {
+      schoolSubjectAverages[subject.code] = schoolSubjectAverages[subject.code] || [];
+      if(subject.grade !== 'AB') schoolSubjectAverages[subject.code].push(subject.marks);
+    });
+  });
+
+  let rows = Object.values(groups).map(group => {
+    const taught = group.students.length;
+    const schoolAvg = avg(schoolSubjectAverages[group.subjectCode] || []);
+    const teacherAvg = avg(group.marks);
+    return {
+      ...group,
+      taught,
+      passPct: taught ? ((group.passCount / taught) * 100).toFixed(1) : '0.0',
+      avgMarks: teacherAvg.toFixed(1),
+      schoolAvg: schoolAvg.toFixed(1),
+      variance: (teacherAvg - schoolAvg).toFixed(1),
+    };
+  });
+  const sortKey = `teacher-review-${cls}`;
+  const teacherSort = sortState[sortKey] || {col:'passPct', dir:-1};
+  rows = rows.sort((a,b) => {
+    const valueA = {
+      teacherName: a.teacherName,
+      department: a.department || '',
+      subjectName: a.subjectName,
+      section: a.section,
+      taught: a.taught,
+      passPct: parseFloat(a.passPct),
+      avgMarks: parseFloat(a.avgMarks),
+      schoolAvg: parseFloat(a.schoolAvg),
+      variance: parseFloat(a.variance),
+      distinctionCount: a.distinctionCount,
+      lowCount: a.lowCount,
+      absentCount: a.absentCount,
+    }[teacherSort.col];
+    const valueB = {
+      teacherName: b.teacherName,
+      department: b.department || '',
+      subjectName: b.subjectName,
+      section: b.section,
+      taught: b.taught,
+      passPct: parseFloat(b.passPct),
+      avgMarks: parseFloat(b.avgMarks),
+      schoolAvg: parseFloat(b.schoolAvg),
+      variance: parseFloat(b.variance),
+      distinctionCount: b.distinctionCount,
+      lowCount: b.lowCount,
+      absentCount: b.absentCount,
+    }[teacherSort.col];
+    if(typeof valueA === 'number' && typeof valueB === 'number') return teacherSort.dir * (valueA - valueB);
+    return teacherSort.dir * String(valueA).localeCompare(String(valueB));
+  });
+
+  target.innerHTML = `
+    <div class="sec-h">
+      <div class="sec-title">Teacher Review - Class ${cls}</div>
+      <div class="sec-sub">Same-class board-result review by mapped subject teacher and section.</div>
+    </div>
+    <div class="review-note">
+      Teacher mapping rows: ${diagnostics.teacherMappings.rows} | Mapped subject rows: ${diagnostics.teacherMappings.matched} | Unmapped subject rows: ${diagnostics.teacherMappings.unmapped}
+    </div>
+    <div class="card">
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>${sortHeader(sortKey,'teacherName','Teacher')}</th><th>${sortHeader(sortKey,'department','Department')}</th><th>${sortHeader(sortKey,'subjectName','Subject')}</th><th>${sortHeader(sortKey,'section','Section')}</th><th>${sortHeader(sortKey,'taught','Taught')}</th><th>${sortHeader(sortKey,'passPct','Pass %')}</th><th>${sortHeader(sortKey,'avgMarks','Avg')}</th><th>${sortHeader(sortKey,'schoolAvg','School Avg')}</th><th>${sortHeader(sortKey,'variance','Variance')}</th><th>${sortHeader(sortKey,'distinctionCount','90+')}</th><th>${sortHeader(sortKey,'lowCount','Below 33')}</th><th>${sortHeader(sortKey,'absentCount','Absent')}</th></tr></thead>
+          <tbody>
+            ${rows.map(row => `
+              <tr>
+                <td><strong>${row.teacherName}</strong></td>
+                <td>${row.department || 'NA'}</td>
+                <td>${row.subjectName}<div style="font-size:11px;color:#999">${row.subjectCode}</div></td>
+                <td>${row.section}</td>
+                <td>${row.taught}</td>
+                <td style="font-family:'DM Mono',monospace;font-weight:700;color:var(--green)">${row.passPct}%</td>
+                <td>${row.avgMarks}</td>
+                <td>${row.schoolAvg}</td>
+                <td style="font-family:'DM Mono',monospace">${row.variance}</td>
+                <td>${row.distinctionCount}</td>
+                <td>${row.lowCount}</td>
+                <td>${row.absentCount}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+function renderFollowUp(cls){
+  const {students} = buildEnrichedStudents(cls);
+  const target = document.getElementById('d-followup');
+  if(!students.length){
+    target.innerHTML = nodata();
+    return;
+  }
+
+  const session = getCurrentSingleSession();
+  const followUps = session?.masterData?.followUps || {};
+  const rows = students.map(student => {
+    const followUp = getFollowUpCategories(student);
+    const key = `${student.cls}|${student.rollNo}`;
+    return {
+      ...student,
+      followUp,
+      saved: followUps[key] || {},
+    };
+  }).filter(row => row.followUp.categories.length).sort((a,b) => {
+    const weight = student => student.result === 'COMP' ? 3 : student.result === 'FAIL' ? 2 : student.result === 'ABST' ? 1 : 0;
+    return weight(b) - weight(a) || a.name.localeCompare(b.name);
+  });
+
+  target.innerHTML = `
+    <div class="sec-h">
+      <div class="sec-title">Follow-Up & Action - Class ${cls}</div>
+      <div class="sec-sub">Post-result review for compartment, fail, absent, and borderline cases.</div>
+    </div>
+    <div class="review-note">
+      This is a board-result follow-up tracker for parent meetings, supplementary preparation, and next-session planning.
+    </div>
+    <div class="card">
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Name</th><th>Roll No</th><th>Section</th><th>Result</th><th>Categories</th><th>Weak Subjects</th><th>Status</th><th>Owner</th><th>Remarks</th></tr></thead>
+          <tbody>
+            ${rows.length ? rows.map(row => `
+              <tr>
+                <td><strong>${row.name}</strong><div style="font-size:11px;color:#999">${row.classTeacher || 'Unmapped class teacher'}</div></td>
+                <td style="font-family:'DM Mono',monospace">${row.rollNo}</td>
+                <td>${row.section || 'UNMAPPED'}</td>
+                <td>${row.result}</td>
+                <td>${row.followUp.categories.map(item => `<span class="followup-tag">${item}</span>`).join('')}</td>
+                <td>${row.followUp.weakSubjects.length ? row.followUp.weakSubjects.map(subject => `${subject.code} (${subject.grade === 'AB' ? 'AB' : subject.marks})`).join(', ') : 'NA'}</td>
+                <td>
+                  <select class="sselect" onchange="updateFollowUpRecord('${row.cls}','${row.rollNo}','status',this.value)">
+                    <option value="">Pending</option>
+                    <option value="Reviewed" ${row.saved.status==='Reviewed'?'selected':''}>Reviewed</option>
+                    <option value="Parent Meeting Done" ${row.saved.status==='Parent Meeting Done'?'selected':''}>Parent Meeting Done</option>
+                    <option value="Supplementary Prep Started" ${row.saved.status==='Supplementary Prep Started'?'selected':''}>Supplementary Prep Started</option>
+                    <option value="Closed" ${row.saved.status==='Closed'?'selected':''}>Closed</option>
+                  </select>
+                </td>
+                <td><input class="followup-input small" type="text" value="${escapeAttr(row.saved.owner || '')}" placeholder="Owner" onchange="updateFollowUpRecord('${row.cls}','${row.rollNo}','owner',this.value)"></td>
+                <td><input class="followup-input" type="text" value="${escapeAttr(row.saved.remarks || '')}" placeholder="Remarks" onchange="updateFollowUpRecord('${row.cls}','${row.rollNo}','remarks',this.value)"></td>
+              </tr>
+            `).join('') : '<tr><td colspan="9" style="text-align:center;padding:32px;color:#ccc">No follow-up students found for this class.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -2763,6 +3555,67 @@ function exportExcel(){
     });
 
     XLSX.utils.book_append_sheet(wb, ws, `Cl ${cls} All Students`);
+  });
+
+  ['X','XII'].forEach(cls => {
+    const enriched = buildEnrichedStudents(cls);
+    if(!enriched.students.length) return;
+
+    const sectionGroups = {};
+    enriched.students.forEach(student => {
+      const key = student.section || 'UNMAPPED';
+      if(!sectionGroups[key]) sectionGroups[key] = [];
+      sectionGroups[key].push(student);
+    });
+    const sectionRows = [['Section','Class Teacher','Students','Pass %','Comp','Fail','Absent','Avg Total']];
+    Object.entries(sectionGroups).forEach(([section, students]) => {
+      const stats = st(students);
+      sectionRows.push([section, students[0]?.classTeacher || 'Unmapped', stats.n, stats.pct + '%', stats.comp, stats.n - stats.pass - stats.comp - stats.abst, stats.abst, avg(students.filter(student => student.result === 'PASS').map(student => tm(student))).toFixed(1)]);
+    });
+    if(sectionRows.length > 1){
+      const ws = XLSX.utils.aoa_to_sheet(sectionRows);
+      ws['!cols'] = [{wch:12},{wch:20},{wch:10},{wch:10},{wch:8},{wch:8},{wch:8},{wch:12}];
+      XLSX.utils.book_append_sheet(wb, ws, `Cl ${cls} Sections`);
+    }
+
+    const teacherGroups = {};
+    enriched.students.forEach(student => {
+      student.subjects.forEach(subject => {
+        const key = `${subject.teacherName}|${subject.code}|${student.section}`;
+        if(!teacherGroups[key]) teacherGroups[key] = {teacher:subject.teacherName, subject:subject.mappedSubjectName || subject.name, code:subject.code, section:student.section, taught:0, pass:0, marks:[], low:0, absent:0};
+        const group = teacherGroups[key];
+        group.taught += 1;
+        if(subject.grade === 'AB') group.absent += 1;
+        else {
+          group.marks.push(subject.marks);
+          if(subject.grade !== 'E' && subject.marks >= 33) group.pass += 1;
+          if(subject.marks < 33) group.low += 1;
+        }
+      });
+    });
+    const teacherRows = [['Teacher','Subject','Code','Section','Taught','Pass %','Average','Below 33','Absent']];
+    Object.values(teacherGroups).forEach(group => {
+      teacherRows.push([group.teacher, group.subject, group.code, group.section, group.taught, ((group.pass / group.taught) * 100).toFixed(1) + '%', avg(group.marks).toFixed(1), group.low, group.absent]);
+    });
+    if(teacherRows.length > 1){
+      const ws = XLSX.utils.aoa_to_sheet(teacherRows);
+      ws['!cols'] = [{wch:24},{wch:24},{wch:8},{wch:10},{wch:10},{wch:10},{wch:10},{wch:10},{wch:8}];
+      XLSX.utils.book_append_sheet(wb, ws, `Cl ${cls} Teachers`);
+    }
+
+    const session = getCurrentSingleSession();
+    const followUpRows = [['Name','Roll No','Section','Result','Categories','Status','Owner','Remarks']];
+    enriched.students.forEach(student => {
+      const followUp = getFollowUpCategories(student);
+      if(!followUp.categories.length) return;
+      const saved = session?.masterData?.followUps?.[`${student.cls}|${student.rollNo}`] || {};
+      followUpRows.push([student.name, student.rollNo, student.section, student.result, followUp.categories.join(', '), saved.status || '', saved.owner || '', saved.remarks || '']);
+    });
+    if(followUpRows.length > 1){
+      const ws = XLSX.utils.aoa_to_sheet(followUpRows);
+      ws['!cols'] = [{wch:24},{wch:12},{wch:10},{wch:10},{wch:30},{wch:22},{wch:20},{wch:28}];
+      XLSX.utils.book_append_sheet(wb, ws, `Cl ${cls} FollowUp`);
+    }
   });
 
   /* ── download ── */
