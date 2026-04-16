@@ -1,7 +1,7 @@
 /* ── SUBJECT NAMES  (source: cbseacademic.nic.in + cbse.gov.in, verified Mar 2026) ── */
 const SN = {
   // ── CLASS X / IX  LANGUAGES ──
-  '001':'English Elective',   '002':'Hindi Elective (Course-A)', '003':'Urdu Elective',
+  '001':'English Elective',   '002':'Hindi Course-A',            '003':'Urdu Elective',
   '085':'Hindi Course-B',     '122':'Sanskrit',                  '184':'English Lang. & Lit.',
 
   // ── CLASS X  CORE ACADEMIC ──
@@ -75,7 +75,15 @@ const SN = {
   '846':'Land Transportation',           '847':'Electronics & Hardware',
   '848':'Design Thinking & Innovation',
 };
-const sn = c => SN[c] || `Subj ${c}`;
+const CLASS_SUBJECT_NAMES = {
+  X: {
+    '241': 'Mathematics Basic',
+  },
+  XII: {
+    '241': 'Applied Mathematics',
+  },
+};
+const sn = (c, cls) => CLASS_SUBJECT_NAMES[cls]?.[c] || SN[c] || `Subj ${c}`;
 
 
 const raw = {X:null, XII:null};
@@ -111,6 +119,20 @@ const FOLLOW_UP_SUFFIX = 'FOLLOWUP';
  */
 function createStudentRecord({rollNo, gender, name, result, cls, compSub, subjects}){
   return {rollNo, gender, name, result, cls, compSub, subjects};
+}
+
+function subjectIsAbsent(subject){
+  return subject.grade === 'AB';
+}
+
+function subjectIsFail(subject){
+  if(subjectIsAbsent(subject)) return false;
+  if(subject.grade === 'E') return true;
+  return subject.grade === 'NA' && subject.marks < 33;
+}
+
+function subjectIsPass(subject){
+  return !subjectIsAbsent(subject) && !subjectIsFail(subject);
 }
 
 function createEmptyMasterData(){
@@ -234,6 +256,10 @@ function addParseWarning(diagnostics, detail){
   diagnostics.warnings.push(detail);
 }
 
+function addParseWarningOnce(diagnostics, detail){
+  if(!diagnostics.warnings.includes(detail)) diagnostics.warnings.push(detail);
+}
+
 function resetCardState(cls){
   uploadRaw[cls] = null;
   document.getElementById('card-'+cls).className = 'upload-card';
@@ -272,9 +298,33 @@ function readFile(file, c){
 
 function normalize(t){ return t.replace(/\r\n/g,'\n').replace(/\r/g,'\n'); }
 
-function buildSubs(codes, toks, result, diagnostics, rollNo){
+const GRADE_RE = /^(A1|A2|B1|B2|C1|C2|D1|D2|E)$/;
+
+function parseSubjectMarkTokens(line, diagnostics){
+  const gradedTokens = [...line.matchAll(/\b(AB|\d{2,3})\s+(A1|A2|B1|B2|C1|C2|D1|D2|E)\b/g)]
+    .map(match => ({raw: match[1], grade: match[2], gradeMissing: false}));
+  if(gradedTokens.length) return gradedTokens;
+
+  const markTokens = (line.match(/\b(?:AB|\d{2,3})\b/g) || [])
+    .filter(token => !GRADE_RE.test(token))
+    .map(token => ({raw: token, grade: null, gradeMissing: token !== 'AB'}));
+  if(markTokens.some(token => token.gradeMissing)){
+    addParseWarningOnce(diagnostics, 'Subject grades are not present in this board file; marks were parsed and grades are shown as NA.');
+  }
+  return markTokens;
+}
+
+function inferMissingGrade(code, rawMark, marks, result, compSub){
+  if(rawMark === 'AB') return 'AB';
+  const compCodes = String(compSub || '').match(/\d{3}/g) || [];
+  if(compCodes.includes(code)) return 'E';
+  if(result === 'FAIL' && marks < 33) return 'E';
+  return 'NA';
+}
+
+function buildSubs(codes, toks, result, diagnostics, rollNo, compSub, cls){
   if(result==='ABST' && toks.length===0){
-    return codes.map(c=>({code:c, name:sn(c), marks:0, grade:'AB'}));
+    return codes.map(c=>({code:c, name:sn(c, cls), marks:0, grade:'AB'}));
   }
 
   if(toks.length===0){
@@ -284,12 +334,16 @@ function buildSubs(codes, toks, result, diagnostics, rollNo){
   }
 
   const usable = Math.min(codes.length, toks.length);
-  return codes.slice(0, usable).map((c,j)=>({
-    code:c,
-    name:sn(c),
-    marks:toks[j][1] === 'AB' ? 0 : parseInt(toks[j][1], 10),
-    grade:toks[j][1] === 'AB' ? 'AB' : toks[j][2]
-  }));
+  return codes.slice(0, usable).map((c,j)=>{
+    const rawMark = toks[j].raw;
+    const marks = rawMark === 'AB' ? 0 : parseInt(rawMark, 10);
+    return {
+      code:c,
+      name:sn(c, cls),
+      marks,
+      grade:rawMark === 'AB' ? 'AB' : (toks[j].grade || inferMissingGrade(c, rawMark, marks, result, compSub))
+    };
+  });
 }
 
 function parseX(text){
@@ -306,8 +360,9 @@ function parseX(text){
     const codes = m[4].trim().split(/\s+/);
     const cm = ln.match(/COMP\s+(\d{3})/);
     const nextLine = lines[i+1] || '';
-    const toks = [...nextLine.matchAll(/(AB|\d{2,3})\s+(A1|A2|B1|B2|C1|C2|D1|D2|E)\b/g)];
-    const subjects = buildSubs(codes, toks, m[5], diagnostics, m[1]);
+    const compSub = cm ? cm[1] : null;
+    const toks = parseSubjectMarkTokens(nextLine, diagnostics);
+    const subjects = buildSubs(codes, toks, m[5], diagnostics, m[1], compSub, 'X');
 
     if(!subjects.length && m[5] !== 'ABST'){
       addParseWarning(diagnostics, `Roll ${m[1]}: no subject marks were parsed from the detail line.`);
@@ -319,7 +374,7 @@ function parseX(text){
       name:m[3].trim(),
       result:m[5],
       cls:'X',
-      compSub:cm ? cm[1] : null,
+      compSub,
       subjects
     }));
     diagnostics.parsedStudents++;
@@ -344,8 +399,9 @@ function parseXII(text){
     const codes = m[4].trim().split(/\s+/);
     const cm = ln.match(/COMP\s+((?:\d{3}[ \t]*)+)/);
     const nextLine = lines[i+1] || '';
-    const toks = [...nextLine.matchAll(/(AB|\d{2,3})\s+(A1|A2|B1|B2|C1|C2|D1|D2|E)\b/g)];
-    const subjects = buildSubs(codes, toks, m[5], diagnostics, m[1]);
+    const compSub = cm ? cm[1].trim() : null;
+    const toks = parseSubjectMarkTokens(nextLine, diagnostics);
+    const subjects = buildSubs(codes, toks, m[5], diagnostics, m[1], compSub, 'XII');
 
     if(!subjects.length && m[5] !== 'ABST'){
       addParseWarning(diagnostics, `Roll ${m[1]}: no subject marks were parsed from the detail line.`);
@@ -357,7 +413,7 @@ function parseXII(text){
       name:m[3].trim(),
       result:m[5],
       cls:'XII',
-      compSub:cm ? cm[1].trim() : null,
+      compSub,
       subjects
     }));
     diagnostics.parsedStudents++;
@@ -682,7 +738,7 @@ function handleMasterFile(e, type){
 function getFollowUpCategories(student){
   const categories = [];
   if(student.result === 'COMP') categories.push('Compartment');
-  const weakSubjects = student.subjects.filter(subject => subject.grade === 'E');
+  const weakSubjects = student.subjects.filter(subject => subjectIsFail(subject));
   if(weakSubjects.length) categories.push('Grade E');
   return {categories, weakSubjects};
 }
@@ -1579,15 +1635,15 @@ function renderSummary(cls){
     });
   });
   // Deduplicate: each student counted once per subject (some students appear in multiple subject rows)
-  // For per-subject pass/comp/absent we check if grade==='E' (failed that subject)
+  // Per-subject pass/fail handles both older grade-bearing files and marks-only files.
   const subjectRows = {};
   sts.forEach(x=>{
     x.subjects.forEach(sub=>{
       if(!subjectRows[sub.code]) subjectRows[sub.code]={name:sub.name,code:sub.code,total:0,pass:0,comp:0,abst:0};
       const r = subjectRows[sub.code];
       r.total++;
-      if(sub.grade==='AB') r.abst++;
-      else if(sub.grade==='E') r.comp++;  // failed this subject (Grade E)
+      if(subjectIsAbsent(sub)) r.abst++;
+      else if(subjectIsFail(sub)) r.comp++;
       else r.pass++;
     });
   });
@@ -1731,11 +1787,11 @@ function renderSubjects(cls){
   sts.forEach(x=>x.subjects.forEach(sub=>{
     if(!sm[sub.code]) sm[sub.code]={code:sub.code,name:sub.name,marks:[],pass:0,n:0,abs:0,grades:{},mb:{}};
     const e=sm[sub.code];
-    if(sub.grade!=='AB'){
+    if(!subjectIsAbsent(sub)){
       e.marks.push(sub.marks); e.n++;
       e.grades[sub.grade]=(e.grades[sub.grade]||0)+1;
       e.mb[getBucket(sub.marks)]=(e.mb[getBucket(sub.marks)]||0)+1;
-      if(sub.grade!=='E') e.pass++;
+      if(subjectIsPass(sub)) e.pass++;
     } else {
       e.abs++;
     }
@@ -1847,11 +1903,11 @@ function renderSubjects(cls){
   sts.forEach(student => student.subjects.forEach(subject => {
     if(!sm[subject.code]) sm[subject.code] = {code:subject.code, name:subject.name, marks:[], pass:0, n:0, abs:0, mb:{}};
     const entry = sm[subject.code];
-    if(subject.grade !== 'AB'){
+    if(!subjectIsAbsent(subject)){
       entry.marks.push(subject.marks);
       entry.n++;
       entry.mb[getBucket(subject.marks)] = (entry.mb[getBucket(subject.marks)] || 0) + 1;
-      if(subject.grade !== 'E') entry.pass++;
+      if(subjectIsPass(subject)) entry.pass++;
     } else {
       entry.abs++;
     }
@@ -1878,11 +1934,11 @@ function renderSubjects(cls){
       }
       const row = teacherDetails[subject.code][key];
       row.total += 1;
-      if(subject.grade === 'AB') row.absent += 1;
+      if(subjectIsAbsent(subject)) row.absent += 1;
       else {
         row.taught += 1;
         row.marks.push(subject.marks);
-        if(subject.grade === 'E') row.fail += 1;
+        if(subjectIsFail(subject)) row.fail += 1;
         else row.pass += 1;
         row.mb[getBucket(subject.marks)] = (row.mb[getBucket(subject.marks)] || 0) + 1;
       }
@@ -3219,12 +3275,12 @@ function exportExcel(){
       if(!sm[sub.code]) sm[sub.code]={code:sub.code,name:sub.name,
         marks:[],marksB:[],marksG:[],pass:0,passB:0,passG:0,n:0,nB:0,nG:0,grades:{}};
       const e=sm[sub.code];
-      if(sub.grade!=='AB'){
+      if(!subjectIsAbsent(sub)){
         e.marks.push(sub.marks); e.n++;
         e.grades[sub.grade]=(e.grades[sub.grade]||0)+1;
-        if(sub.grade!=='E') e.pass++;
-        if(s.gender==='M'){e.marksB.push(sub.marks);e.nB++;if(sub.grade!=='E')e.passB++;}
-        else              {e.marksG.push(sub.marks);e.nG++;if(sub.grade!=='E')e.passG++;}
+        if(subjectIsPass(sub)) e.pass++;
+        if(s.gender==='M'){e.marksB.push(sub.marks);e.nB++;if(subjectIsPass(sub))e.passB++;}
+        else              {e.marksG.push(sub.marks);e.nG++;if(subjectIsPass(sub))e.passG++;}
       }
     }));
     return Object.values(sm).filter(s=>s.marks.length>0).sort((a,b)=>xavg(b.marks)-xavg(a.marks));
@@ -3299,8 +3355,8 @@ function exportExcel(){
       sts.forEach(x=>x.subjects.forEach(sub=>{
         if(!subjectRows[sub.code]) subjectRows[sub.code]={name:sub.name,code:sub.code,total:0,pass:0,comp:0,abst:0};
         const r=subjectRows[sub.code]; r.total++;
-        if(sub.grade==='AB') r.abst++;
-        else if(sub.marks<33) r.comp++;
+        if(subjectIsAbsent(sub)) r.abst++;
+        else if(subjectIsFail(sub)) r.comp++;
         else r.pass++;
       }));
       Object.values(subjectRows).sort((a,b)=>b.total-a.total).forEach(r=>{
