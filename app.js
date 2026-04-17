@@ -140,6 +140,10 @@ function createEmptyMasterData(){
     studentMaster: [],
     teacherMappings: [],
     followUps: {},
+    mappingFiles: {
+      studentMaster: {status:'idle', fileName:'', expected:[]},
+      teacherMappings: {status:'idle', fileName:'', expected:[]},
+    },
     diagnostics: {
       studentMaster: {rows:0, matched:0, unmapped:0},
       teacherMappings: {rows:0, matched:0, unmapped:0},
@@ -153,6 +157,10 @@ function createSessionId(schoolCode, year){
 
 function getSessionStorageKey(session, suffix){
   return `${session.schoolCode}-${session.year}-${suffix}`;
+}
+
+function getMappingStorageKey(session, type){
+  return getSessionStorageKey(session, type === 'student' ? STUDENT_MASTER_SUFFIX : TEACHER_MAPPING_SUFFIX);
 }
 
 function getSessionLabel(session){
@@ -244,6 +252,13 @@ function escapeAttr(value){
   return String(value || '')
     .replace(/&/g, '&amp;')
     .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function escapeHtml(value){
+  return String(value || '')
+    .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
@@ -552,12 +567,17 @@ function loadSessionMasterData(session){
     const studentMaster = JSON.parse(localStorage.getItem(getSessionStorageKey(session, STUDENT_MASTER_SUFFIX)) || '[]');
     const teacherMappings = JSON.parse(localStorage.getItem(getSessionStorageKey(session, TEACHER_MAPPING_SUFFIX)) || '[]');
     const followUps = JSON.parse(localStorage.getItem(getSessionStorageKey(session, FOLLOW_UP_SUFFIX)) || '{}');
-    return {
+    const loaded = {
       ...fallback,
+      // Backward compatibility: older versions persisted mapping rows in localStorage.
+      // New saves keep these memory-only and reload from same-folder Excel files.
       studentMaster: Array.isArray(studentMaster) ? studentMaster : [],
       teacherMappings: Array.isArray(teacherMappings) ? teacherMappings : [],
       followUps: followUps && typeof followUps === 'object' ? followUps : {},
     };
+    if(loaded.studentMaster.length) loaded.mappingFiles.studentMaster = {status:'legacy', fileName:'older saved data', expected:getMappingFileCandidates(session, 'student')};
+    if(loaded.teacherMappings.length) loaded.mappingFiles.teacherMappings = {status:'legacy', fileName:'older saved data', expected:getMappingFileCandidates(session, 'teacher')};
+    return loaded;
   } catch {
     return fallback;
   }
@@ -565,8 +585,6 @@ function loadSessionMasterData(session){
 
 function persistMasterData(session){
   const masterData = session.masterData || createEmptyMasterData();
-  localStorage.setItem(getSessionStorageKey(session, STUDENT_MASTER_SUFFIX), JSON.stringify(masterData.studentMaster || []));
-  localStorage.setItem(getSessionStorageKey(session, TEACHER_MAPPING_SUFFIX), JSON.stringify(masterData.teacherMappings || []));
   localStorage.setItem(getSessionStorageKey(session, FOLLOW_UP_SUFFIX), JSON.stringify(masterData.followUps || {}));
 }
 
@@ -645,10 +663,110 @@ function mapTeacherRows(rows){
 
 function readWorkbookRows(file){
   return file.arrayBuffer().then(buffer => {
-    const workbook = XLSX.read(buffer, {type:'array'});
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    return XLSX.utils.sheet_to_json(sheet, {defval:''});
+    return readWorkbookRowsFromBuffer(buffer);
   });
+}
+
+function readWorkbookRowsFromBuffer(buffer){
+  const workbook = XLSX.read(buffer, {type:'array'});
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  return XLSX.utils.sheet_to_json(sheet, {defval:''});
+}
+
+function sanitizeMappingFileToken(value){
+  return String(value || '')
+    .trim()
+    .replace(/\s+/g, '_')
+    .replace(/[\\/:*?"<>|#%&{}$!'@+=`]/g, '')
+    .replace(/_+/g, '_');
+}
+
+function getMappingFileCandidates(session, type){
+  const schoolCode = sanitizeMappingFileToken(session?.schoolCode || '');
+  const year = sanitizeMappingFileToken(session?.year || '');
+  const suffix = type === 'student' ? 'student_master' : 'teacher_mapping';
+  const candidates = [];
+  if(schoolCode && year) candidates.push(`${schoolCode}-${year}-${suffix}.xlsx`);
+  if(schoolCode) candidates.push(`${schoolCode}-${suffix}.xlsx`);
+  candidates.push(`${suffix}.xlsx`);
+  return [...new Set(candidates)];
+}
+
+function setMappingFileStatus(session, type, status){
+  if(!session) return;
+  const masterData = session.masterData || createEmptyMasterData();
+  const key = type === 'student' ? 'studentMaster' : 'teacherMappings';
+  masterData.mappingFiles = {
+    ...(masterData.mappingFiles || createEmptyMasterData().mappingFiles),
+    [key]: {
+      ...(masterData.mappingFiles?.[key] || {}),
+      ...status,
+    }
+  };
+  session.masterData = masterData;
+}
+
+function clearPersistedMappingData(session){
+  if(!session) return;
+  localStorage.removeItem(getMappingStorageKey(session, 'student'));
+  localStorage.removeItem(getMappingStorageKey(session, 'teacher'));
+}
+
+async function fetchMappingRows(fileName){
+  const response = await fetch(encodeURI(fileName), {cache:'no-store'});
+  if(!response.ok) return null;
+  const buffer = await response.arrayBuffer();
+  return readWorkbookRowsFromBuffer(buffer);
+}
+
+async function autoLoadMappingFile(session, type){
+  const candidates = getMappingFileCandidates(session, type);
+  const dataKey = type === 'student' ? 'studentMaster' : 'teacherMappings';
+  const currentStatus = session.masterData?.mappingFiles?.[dataKey]?.status;
+  if((currentStatus === 'loaded' || currentStatus === 'manual') && session.masterData?.[dataKey]?.length){
+    return true;
+  }
+  setMappingFileStatus(session, type, {status:'loading', fileName:'', expected:candidates});
+
+  for(const fileName of candidates){
+    try {
+      const rows = await fetchMappingRows(fileName);
+      if(!rows) continue;
+      const mappedRows = type === 'student' ? mapStudentMasterRows(rows) : mapTeacherRows(rows);
+      const masterData = session.masterData || createEmptyMasterData();
+      masterData[dataKey] = mappedRows;
+      session.masterData = masterData;
+      setMappingFileStatus(session, type, {status:'loaded', fileName, expected:candidates});
+      clearPersistedMappingData(session);
+      return true;
+    } catch {
+      // Try the next expected same-folder file name.
+    }
+  }
+
+  if(currentStatus === 'legacy' && session.masterData?.[dataKey]?.length){
+    setMappingFileStatus(session, type, {status:'legacy', fileName:'older saved data', expected:candidates});
+    return true;
+  }
+  setMappingFileStatus(session, type, {status:'missing', fileName:'', expected:candidates});
+  return false;
+}
+
+async function autoLoadMappingFiles(session){
+  if(!session || session._mappingLoadPromise) return session?._mappingLoadPromise || Promise.resolve(false);
+  session._mappingLoadPromise = Promise.all([
+    autoLoadMappingFile(session, 'student'),
+    autoLoadMappingFile(session, 'teacher'),
+  ]).then(results => {
+    session._mappingLoadPromise = null;
+    if(activeSessionId === session.sessionId && !isMultiMode()){
+      renderWorkspacePanel();
+      renderSec();
+    }
+    return results.some(Boolean);
+  });
+  renderWorkspacePanel();
+  return session._mappingLoadPromise;
 }
 
 function getCurrentSingleSession(){
@@ -721,12 +839,15 @@ function handleMasterFile(e, type){
     const masterData = session.masterData || createEmptyMasterData();
     if(type === 'student'){
       masterData.studentMaster = mapStudentMasterRows(rows);
+      setMappingFileStatus(session, 'student', {status:'manual', fileName:file.name, expected:getMappingFileCandidates(session, 'student')});
       alert(`Student master loaded: ${masterData.studentMaster.length} valid row(s).`);
     } else {
       masterData.teacherMappings = mapTeacherRows(rows);
+      setMappingFileStatus(session, 'teacher', {status:'manual', fileName:file.name, expected:getMappingFileCandidates(session, 'teacher')});
       alert(`Teacher mapping loaded: ${masterData.teacherMappings.length} valid row(s).`);
     }
     session.masterData = masterData;
+    clearPersistedMappingData(session);
     persistMasterData(session);
     renderWorkspacePanel();
     renderSec();
@@ -834,6 +955,7 @@ function runAnalysis(){
   renderActiveWorkspaceHeader();
   buildClassTabs();
   switchClass(DB.X.length ? 'X' : 'XII');
+  autoLoadMappingFiles(merged);
 }
 
 function saveToLocalStorage(){ /* school sessions are persisted during runAnalysis */ }
@@ -883,12 +1005,8 @@ function exportBackup(){
       }
     })),
     combinations: savedCombinations,
-    studentMasters: sessions
-      .filter(session => session.masterData?.studentMaster?.length)
-      .map(session => ({schoolCode: session.schoolCode, year: session.year, rows: session.masterData.studentMaster})),
-    teacherMappings: sessions
-      .filter(session => session.masterData?.teacherMappings?.length)
-      .map(session => ({schoolCode: session.schoolCode, year: session.year, rows: session.masterData.teacherMappings})),
+    studentMasters: [],
+    teacherMappings: [],
     followUps: sessions
       .filter(session => session.masterData?.followUps && Object.keys(session.masterData.followUps).length)
       .map(session => ({schoolCode: session.schoolCode, year: session.year, rows: session.masterData.followUps}))
@@ -931,6 +1049,20 @@ function syncWorkspaceControls(){
   }
 }
 
+function renderMappingFileChip(label, rowCount, status){
+  const state = status?.status || 'idle';
+  const expected = status?.expected || [];
+  let note = 'Not loaded';
+  if(state === 'loading') note = 'Looking in folder...';
+  else if(state === 'loaded') note = `Loaded ${status.fileName}`;
+  else if(state === 'manual') note = `Uploaded ${status.fileName}`;
+  else if(state === 'legacy') note = 'Loaded from older saved data';
+  else if(state === 'missing') note = `Expected ${expected.slice(0, 2).join(' or ')}`;
+  else if(rowCount) note = 'Loaded from older saved data';
+
+  return `<span class="master-chip" title="${escapeAttr(note)}">${label} <strong>${rowCount}</strong><small>${escapeHtml(note)}</small></span>`;
+}
+
 function renderWorkspacePanel(){
   syncWorkspaceControls();
   const sessions = collectSavedSessions();
@@ -945,10 +1077,11 @@ function renderWorkspacePanel(){
     : 'Upload or restore schools to start a multischool workspace.';
   if(session && !isMultiMode()){
     workspaceSub.innerHTML += `<div class="master-status">
-      <span class="master-chip">Student Master <strong>${masterData.studentMaster.length}</strong></span>
-      <span class="master-chip">Teacher Mapping <strong>${masterData.teacherMappings.length}</strong></span>
+      ${renderMappingFileChip('Student Master', masterData.studentMaster.length, masterData.mappingFiles?.studentMaster)}
+      ${renderMappingFileChip('Teacher Mapping', masterData.teacherMappings.length, masterData.mappingFiles?.teacherMappings)}
       <span class="master-chip">Follow-Up Notes <strong>${Object.keys(masterData.followUps || {}).length}</strong></span>
-    </div>`;
+    </div>
+    <div class="mapping-helper">Auto-load uses school-code Excel files in this folder. Upload only if you want to override for this session.</div>`;
   }
 
   sessionList.innerHTML = sessions.length ? sessions.map(session => {
@@ -1020,6 +1153,7 @@ function openSingleSession(sessionId){
   renderWorkspacePanel();
   buildClassTabs();
   switchClass(DB.X.length ? 'X' : 'XII');
+  autoLoadMappingFiles(session);
 }
 
 function onWorkspaceModeChange(){
@@ -1199,11 +1333,17 @@ function showRestoreBanner(message){
   banner.classList.add('show');
 }
 
-function restoreSession(session, source){
-  mergeSessionIntoRegistry(buildSessionFromRawClasses({
+function restoreSession(session, source, restoredMasterData){
+  const merged = mergeSessionIntoRegistry(buildSessionFromRawClasses({
     X: session.classes?.X?.rawText || session.classes?.X || null,
     XII: session.classes?.XII?.rawText || session.classes?.XII || null,
   }));
+  if(restoredMasterData){
+    merged.masterData = {
+      ...(merged.masterData || createEmptyMasterData()),
+      ...restoredMasterData,
+    };
+  }
   openSingleSession(createSessionId(session.schoolCode, session.year));
   showRestoreBanner(`${source} - School ${session.schoolCode} | ${session.year}`);
 }
@@ -1237,12 +1377,28 @@ function doImport(){
       const followUps = (overlayState.payload?.followUps || []).find(entry =>
         entry.schoolCode === item.schoolCode && String(entry.year) === String(item.year)
       );
-      if(studentMaster) localStorage.setItem(`${item.schoolCode}-${item.year}-${STUDENT_MASTER_SUFFIX}`, JSON.stringify(studentMaster.rows || []));
-      if(teacherMapping) localStorage.setItem(`${item.schoolCode}-${item.year}-${TEACHER_MAPPING_SUFFIX}`, JSON.stringify(teacherMapping.rows || []));
       if(followUps) localStorage.setItem(`${item.schoolCode}-${item.year}-${FOLLOW_UP_SUFFIX}`, JSON.stringify(followUps.rows || {}));
       rebuildSessionsFromLocalStorage();
       closeImportOverlay();
-      restoreSession(item, 'Data restored from backup');
+      const restoredMasterData = createEmptyMasterData();
+      if(studentMaster){
+        restoredMasterData.studentMaster = mapStudentMasterRows(studentMaster.rows || []);
+        setMappingFileStatus(
+          {masterData: restoredMasterData, schoolCode:item.schoolCode, year:item.year},
+          'student',
+          {status:'manual', fileName:'backup JSON', expected:getMappingFileCandidates(item, 'student')}
+        );
+      }
+      if(teacherMapping){
+        restoredMasterData.teacherMappings = mapTeacherRows(teacherMapping.rows || []);
+        setMappingFileStatus(
+          {masterData: restoredMasterData, schoolCode:item.schoolCode, year:item.year},
+          'teacher',
+          {status:'manual', fileName:'backup JSON', expected:getMappingFileCandidates(item, 'teacher')}
+        );
+      }
+      if(followUps) restoredMasterData.followUps = followUps.rows || {};
+      restoreSession(item, 'Data restored from backup', restoredMasterData);
       return;
     }
     savedCombinations = [...savedCombinations, {...item, kind:undefined}];
