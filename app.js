@@ -139,14 +139,21 @@ function createEmptyMasterData(){
   return {
     studentMaster: [],
     teacherMappings: [],
+    performanceMarks: {
+      componentType: null,
+      rows: [],
+      reportRows: [],
+    },
     followUps: {},
     mappingFiles: {
       studentMaster: {status:'idle', fileName:'', expected:[]},
       teacherMappings: {status:'idle', fileName:'', expected:[]},
+      performanceMarks: {status:'idle', fileName:'', expected:[]},
     },
     diagnostics: {
       studentMaster: {rows:0, matched:0, unmapped:0},
       teacherMappings: {rows:0, matched:0, unmapped:0},
+      performanceMarks: {rows:0, matched:0, unmatched:0, duplicateRows:0, duplicateKeys:0, derivedTheory:0, missingCoverage:0, scopedClasses:[]},
     }
   };
 }
@@ -339,7 +346,7 @@ function inferMissingGrade(code, rawMark, marks, result, compSub){
 
 function buildSubs(codes, toks, result, diagnostics, rollNo, compSub, cls){
   if(result==='ABST' && toks.length===0){
-    return codes.map(c=>({code:c, name:sn(c, cls), marks:0, grade:'AB'}));
+    return codes.map(c=>({code:c, name:sn(c, cls), marks:0, grade:'AB', theoryMarks:null, componentMarks:null, componentType:null, componentMaxMarks:null, theoryMaxMarks:null}));
   }
 
   if(toks.length===0){
@@ -356,7 +363,12 @@ function buildSubs(codes, toks, result, diagnostics, rollNo, compSub, cls){
       code:c,
       name:sn(c, cls),
       marks,
-      grade:rawMark === 'AB' ? 'AB' : (toks[j].grade || inferMissingGrade(c, rawMark, marks, result, compSub))
+      grade:rawMark === 'AB' ? 'AB' : (toks[j].grade || inferMissingGrade(c, rawMark, marks, result, compSub)),
+      theoryMarks:null,
+      componentMarks:null,
+      componentType:null,
+      componentMaxMarks:null,
+      theoryMaxMarks:null,
     };
   });
 }
@@ -661,6 +673,170 @@ function mapTeacherRows(rows){
   })).filter(row => row.class && row.section && row.subjectCode && row.teacherName);
 }
 
+function normalizeSubjectCodeValue(value){
+  return String(value || '').trim().padStart(3, '0');
+}
+
+function parseNumericCell(value){
+  if(value === undefined || value === null || String(value).trim() === '') return null;
+  const cleaned = String(value).trim().replace(/,/g, '');
+  const numeric = Number(cleaned);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function mapPerformanceRows(rows, componentType){
+  return rows.map(row => ({
+    rollNo: normalizeRollValue(pickRowValue(row, ['rollno','rollnumber','admissionno'])),
+    class: normalizeClassValue(pickRowValue(row, ['class','cls'])),
+    subjectCode: normalizeSubjectCodeValue(pickRowValue(row, ['subjectcode','subcode','code'])),
+    componentMarks: parseNumericCell(pickRowValue(row, ['componentmarks','internalmarks','practicalmarks','marks'])),
+    componentMaxMarks: parseNumericCell(pickRowValue(row, ['componentmaxmarks','internalmaxmarks','practicalmaxmarks','maxmarks','max'])),
+    componentType,
+  })).filter(row =>
+    row.rollNo &&
+    row.class &&
+    row.subjectCode &&
+    row.componentMarks !== null &&
+    row.componentMaxMarks !== null
+  );
+}
+
+function resetPerformanceEnrichment(session){
+  if(!session) return;
+  ['X','XII'].forEach(cls => {
+    const classBundle = session.classes?.[cls];
+    if(!classBundle?.students) return;
+    classBundle.students.forEach(student => {
+      student.subjects.forEach(subject => {
+        subject.theoryMarks = null;
+        subject.componentMarks = null;
+        subject.componentType = null;
+        subject.componentMaxMarks = null;
+        subject.theoryMaxMarks = null;
+      });
+    });
+  });
+}
+
+function applyPerformanceRows(session, rows, componentType){
+  const masterData = session.masterData || createEmptyMasterData();
+  const diagnostics = {rows: rows.length, matched: 0, unmatched: 0, duplicateRows: 0, duplicateKeys: 0, derivedTheory: 0, missingCoverage: 0, scopedClasses: []};
+  const studentLookup = new Map();
+  const subjectLookup = new Map();
+  const matchedKeys = new Set();
+  const reportRows = [];
+  const uploadKeyCounts = new Map();
+  const uploadedClasses = new Set(rows.map(row => row.class).filter(Boolean));
+
+  resetPerformanceEnrichment(session);
+
+  ['X','XII'].forEach(cls => {
+    const classBundle = session.classes?.[cls];
+    if(!classBundle?.students) return;
+    classBundle.students.forEach(student => {
+      studentLookup.set(`${student.rollNo}|${student.cls}`, student);
+      student.subjects.forEach(subject => {
+        subjectLookup.set(`${student.rollNo}|${student.cls}|${subject.code}`, {student, subject});
+      });
+    });
+  });
+
+  rows.forEach(row => {
+    const matchKey = `${row.rollNo}|${row.class}|${row.subjectCode}`;
+    uploadKeyCounts.set(matchKey, (uploadKeyCounts.get(matchKey) || 0) + 1);
+    const subjectEntry = subjectLookup.get(matchKey);
+    const duplicateCount = uploadKeyCounts.get(matchKey);
+    if(duplicateCount > 1){
+      diagnostics.duplicateRows += 1;
+      reportRows.push({
+        ...row,
+        status: 'Duplicate Upload',
+        reason: `Duplicate upload key for ${row.rollNo} / ${row.class} / ${row.subjectCode}`,
+        studentName: subjectEntry?.student?.name || '',
+        subjectName: subjectEntry?.subject?.name || '',
+        totalMarks: subjectEntry?.subject?.marks ?? '',
+        theoryMarks: '',
+        theoryMaxMarks: '',
+      });
+      return;
+    }
+    if(subjectEntry){
+      const {student, subject} = subjectEntry;
+      matchedKeys.add(matchKey);
+      diagnostics.matched += 1;
+      subject.componentMarks = row.componentMarks;
+      subject.componentType = componentType;
+      subject.componentMaxMarks = row.componentMaxMarks;
+      subject.theoryMarks = Math.max(0, (subject.marks || 0) - row.componentMarks);
+      subject.theoryMaxMarks = Math.max(0, 100 - row.componentMaxMarks);
+      diagnostics.derivedTheory += 1;
+      reportRows.push({
+        ...row,
+        status: 'Matched',
+        reason: '',
+        studentName: student.name,
+        subjectName: subject.name,
+        totalMarks: subject.marks,
+        theoryMarks: subject.theoryMarks,
+        theoryMaxMarks: subject.theoryMaxMarks,
+      });
+      return;
+    }
+
+    const student = studentLookup.get(`${row.rollNo}|${row.class}`);
+    reportRows.push({
+      ...row,
+      status: 'Missing',
+      reason: student ? 'Subject code not found for this student in analysed results' : 'Student not found in analysed results',
+      studentName: student?.name || '',
+      subjectName: '',
+      totalMarks: '',
+      theoryMarks: '',
+      theoryMaxMarks: '',
+    });
+  });
+
+  subjectLookup.forEach(({student, subject}, key) => {
+    if(matchedKeys.has(key) || subjectIsAbsent(subject) || !uploadedClasses.has(student.cls)) return;
+    diagnostics.missingCoverage += 1;
+    reportRows.push({
+      rollNo: student.rollNo,
+      class: student.cls,
+      subjectCode: subject.code,
+      componentMarks: '',
+      componentMaxMarks: '',
+      componentType,
+      status: 'Missing',
+      reason: 'No uploaded component row for this analysed subject',
+      studentName: student.name,
+      subjectName: subject.name,
+      totalMarks: subject.marks,
+      theoryMarks: '',
+      theoryMaxMarks: '',
+    });
+  });
+
+  diagnostics.unmatched = reportRows.filter(row => row.status === 'Missing' && row.reason !== 'No uploaded component row for this analysed subject').length;
+  diagnostics.duplicateKeys = [...uploadKeyCounts.values()].filter(count => count > 1).length;
+  diagnostics.scopedClasses = [...uploadedClasses];
+
+  masterData.performanceMarks = {
+    componentType,
+    rows,
+    reportRows,
+  };
+  masterData.diagnostics = {
+    ...(masterData.diagnostics || createEmptyMasterData().diagnostics),
+    performanceMarks: diagnostics,
+  };
+  session.masterData = masterData;
+  return diagnostics;
+}
+
+function getSelectedPerformanceComponentType(){
+  return document.getElementById('performance-component-type')?.value === 'practical' ? 'practical' : 'internal';
+}
+
 function readWorkbookRows(file){
   return file.arrayBuffer().then(buffer => {
     return readWorkbookRowsFromBuffer(buffer);
@@ -692,10 +868,31 @@ function getMappingFileCandidates(session, type){
   return [...new Set(candidates)];
 }
 
+function getPerformanceFileCandidates(session){
+  const schoolCode = sanitizeMappingFileToken(session?.schoolCode || '');
+  const year = sanitizeMappingFileToken(session?.year || '');
+  const candidates = [];
+  const addCandidates = componentType => {
+    const suffix = componentType === 'practical' ? 'practical_marks' : 'internal_marks';
+    if(schoolCode && year) candidates.push({fileName: `${schoolCode}-${year}-${suffix}.xlsx`, componentType});
+    if(schoolCode) candidates.push({fileName: `${schoolCode}-${suffix}.xlsx`, componentType});
+    candidates.push({fileName: `${suffix}.xlsx`, componentType});
+  };
+  addCandidates('internal');
+  addCandidates('practical');
+  return candidates.filter((item, index, arr) =>
+    arr.findIndex(other => other.fileName === item.fileName && other.componentType === item.componentType) === index
+  );
+}
+
 function setMappingFileStatus(session, type, status){
   if(!session) return;
   const masterData = session.masterData || createEmptyMasterData();
-  const key = type === 'student' ? 'studentMaster' : 'teacherMappings';
+  const key = type === 'student'
+    ? 'studentMaster'
+    : type === 'teacher'
+      ? 'teacherMappings'
+      : 'performanceMarks';
   masterData.mappingFiles = {
     ...(masterData.mappingFiles || createEmptyMasterData().mappingFiles),
     [key]: {
@@ -720,6 +917,10 @@ async function fetchMappingRows(fileName){
 }
 
 async function autoLoadMappingFile(session, type){
+  if(window.location.protocol === 'file:'){
+    setMappingFileStatus(session, type, {status:'blocked', fileName:'', expected:getMappingFileCandidates(session, type)});
+    return false;
+  }
   const candidates = getMappingFileCandidates(session, type);
   const dataKey = type === 'student' ? 'studentMaster' : 'teacherMappings';
   const currentStatus = session.masterData?.mappingFiles?.[dataKey]?.status;
@@ -752,11 +953,54 @@ async function autoLoadMappingFile(session, type){
   return false;
 }
 
+async function autoLoadPerformanceFile(session){
+  if(window.location.protocol === 'file:'){
+    setMappingFileStatus(session, 'performance', {
+      status:'blocked',
+      fileName:'',
+      expected:getPerformanceFileCandidates(session).map(item => item.fileName),
+    });
+    return false;
+  }
+  const candidates = getPerformanceFileCandidates(session);
+  const currentStatus = session.masterData?.mappingFiles?.performanceMarks?.status;
+  if((currentStatus === 'loaded' || currentStatus === 'manual') && session.masterData?.performanceMarks?.rows?.length){
+    return true;
+  }
+  setMappingFileStatus(session, 'performance', {status:'loading', fileName:'', expected:candidates.map(item => item.fileName)});
+
+  for(const candidate of candidates){
+    try {
+      const rows = await fetchMappingRows(candidate.fileName);
+      if(!rows) continue;
+      const performanceRows = mapPerformanceRows(rows, candidate.componentType);
+      if(!performanceRows.length) continue;
+      applyPerformanceRows(session, performanceRows, candidate.componentType);
+      setMappingFileStatus(session, 'performance', {
+        status:'loaded',
+        fileName:candidate.fileName,
+        expected:candidates.map(item => item.fileName),
+      });
+      return true;
+    } catch {
+      // Try the next expected same-folder performance file name.
+    }
+  }
+
+  setMappingFileStatus(session, 'performance', {
+    status:'missing',
+    fileName:'',
+    expected:candidates.map(item => item.fileName),
+  });
+  return false;
+}
+
 async function autoLoadMappingFiles(session){
   if(!session || session._mappingLoadPromise) return session?._mappingLoadPromise || Promise.resolve(false);
   session._mappingLoadPromise = Promise.all([
     autoLoadMappingFile(session, 'student'),
     autoLoadMappingFile(session, 'teacher'),
+    autoLoadPerformanceFile(session),
   ]).then(results => {
     session._mappingLoadPromise = null;
     if(activeSessionId === session.sessionId && !isMultiMode()){
@@ -836,17 +1080,26 @@ function handleMasterFile(e, type){
   }
 
   readWorkbookRows(file).then(rows => {
-    const masterData = session.masterData || createEmptyMasterData();
     if(type === 'student'){
+      const masterData = session.masterData || createEmptyMasterData();
       masterData.studentMaster = mapStudentMasterRows(rows);
       setMappingFileStatus(session, 'student', {status:'manual', fileName:file.name, expected:getMappingFileCandidates(session, 'student')});
+      session.masterData = masterData;
       alert(`Student master loaded: ${masterData.studentMaster.length} valid row(s).`);
-    } else {
+    } else if(type === 'teacher') {
+      const masterData = session.masterData || createEmptyMasterData();
       masterData.teacherMappings = mapTeacherRows(rows);
       setMappingFileStatus(session, 'teacher', {status:'manual', fileName:file.name, expected:getMappingFileCandidates(session, 'teacher')});
+      session.masterData = masterData;
       alert(`Teacher mapping loaded: ${masterData.teacherMappings.length} valid row(s).`);
+    } else {
+      const componentType = getSelectedPerformanceComponentType();
+      const performanceRows = mapPerformanceRows(rows, componentType);
+      const diagnostics = applyPerformanceRows(session, performanceRows, componentType);
+      const label = componentType === 'practical' ? 'Practical' : 'Internal';
+      setMappingFileStatus(session, 'performance', {status:'manual', fileName:file.name, expected:[]});
+      alert(`${label} marks loaded: ${diagnostics.rows} valid row(s), ${diagnostics.matched} matched subject row(s).`);
     }
-    session.masterData = masterData;
     clearPersistedMappingData(session);
     persistMasterData(session);
     renderWorkspacePanel();
@@ -1035,9 +1288,14 @@ function syncWorkspaceControls(){
   const yearEl = document.getElementById('compare-year');
   const classEl = document.getElementById('compare-class');
   const meritEl = document.getElementById('compare-merit-scope');
+  const performanceTypeEl = document.getElementById('performance-component-type');
   if(modeEl) modeEl.value = workspaceState.mode;
   if(classEl) classEl.value = workspaceState.classScope;
   if(meritEl) meritEl.value = workspaceState.meritScope;
+  if(performanceTypeEl){
+    const session = getCurrentSingleSession();
+    performanceTypeEl.value = session?.masterData?.performanceMarks?.componentType || 'internal';
+  }
   if(yearEl){
     const sessions = collectSavedSessions();
     const years = [...new Set(sessions.map(session => session.year))].sort().reverse();
@@ -1057,10 +1315,68 @@ function renderMappingFileChip(label, rowCount, status){
   else if(state === 'loaded') note = `Loaded ${status.fileName}`;
   else if(state === 'manual') note = `Uploaded ${status.fileName}`;
   else if(state === 'legacy') note = 'Loaded from older saved data';
-  else if(state === 'missing') note = `Expected ${expected.slice(0, 2).join(' or ')}`;
+  else if(state === 'blocked') note = 'Use http://127.0.0.1:8000, not file://';
+  else if(state === 'missing') note = expected.length ? `Expected ${expected.slice(0, 2).join(' or ')}` : 'Not loaded';
   else if(rowCount) note = 'Loaded from older saved data';
 
   return `<span class="master-chip" title="${escapeAttr(note)}">${label} <strong>${rowCount}</strong><small>${escapeHtml(note)}</small></span>`;
+}
+
+function renderPerformanceReport(masterData){
+  const reportRows = masterData?.performanceMarks?.reportRows || [];
+  if(!reportRows.length) return '';
+  const diagnostics = masterData?.diagnostics?.performanceMarks || createEmptyMasterData().diagnostics.performanceMarks;
+  const matched = reportRows.filter(row => row.status === 'Matched').length;
+  const duplicate = reportRows.filter(row => row.status === 'Duplicate Upload').length;
+  const missing = reportRows.filter(row => row.status === 'Missing').length;
+  const scopeLabel = diagnostics.scopedClasses?.length ? diagnostics.scopedClasses.join(', ') : 'uploaded classes';
+  const sortedRows = [...reportRows].sort((a, b) => {
+    const order = {'Missing':0, 'Duplicate Upload':1, 'Matched':2};
+    if(a.status !== b.status) return (order[a.status] ?? 9) - (order[b.status] ?? 9);
+    return String(a.rollNo).localeCompare(String(b.rollNo)) || String(a.subjectCode).localeCompare(String(b.subjectCode));
+  });
+  return `
+    <details class="performance-report">
+      <summary>Performance Upload Report <strong>${reportRows.length}</strong><span>Scope ${scopeLabel} | Uploaded ${diagnostics.rows} | Matched ${matched} | Duplicate upload rows ${duplicate} | Upload unmatched ${diagnostics.unmatched} | Expected subject rows missing upload ${diagnostics.missingCoverage}</span></summary>
+      <div class="performance-report-table tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Reason</th>
+              <th>Roll No</th>
+              <th>Class</th>
+              <th>Student</th>
+              <th>Subject Code</th>
+              <th>Subject</th>
+              <th>Component</th>
+              <th>Component Max</th>
+              <th>Total</th>
+              <th>Theory</th>
+              <th>Theory Max</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${sortedRows.map(row => `
+              <tr>
+                <td><span class="report-status ${row.status === 'Matched' ? 'ok' : 'miss'}">${row.status}</span></td>
+                <td>${escapeHtml(row.reason || '-')}</td>
+                <td>${escapeHtml(row.rollNo)}</td>
+                <td>${escapeHtml(row.class)}</td>
+                <td>${escapeHtml(row.studentName || '-')}</td>
+                <td>${escapeHtml(row.subjectCode)}</td>
+                <td>${escapeHtml(row.subjectName || '-')}</td>
+                <td>${row.componentMarks}</td>
+                <td>${row.componentMaxMarks}</td>
+                <td>${row.totalMarks === '' ? '-' : row.totalMarks}</td>
+                <td>${row.theoryMarks === '' ? '-' : row.theoryMarks}</td>
+                <td>${row.theoryMaxMarks === '' ? '-' : row.theoryMaxMarks}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </details>`;
 }
 
 function renderWorkspacePanel(){
@@ -1076,12 +1392,18 @@ function renderWorkspacePanel(){
     ? `${selectedCount} school${selectedCount > 1 ? 's' : ''} selected. Use Multi-School mode for comparison and combined merit.`
     : 'Upload or restore schools to start a multischool workspace.';
   if(session && !isMultiMode()){
+    const performanceRows = masterData.performanceMarks?.rows?.length || 0;
+    const performanceType = masterData.performanceMarks?.componentType
+      ? (masterData.performanceMarks.componentType === 'practical' ? 'Practical' : 'Internal')
+      : 'Performance';
     workspaceSub.innerHTML += `<div class="master-status">
       ${renderMappingFileChip('Student Master', masterData.studentMaster.length, masterData.mappingFiles?.studentMaster)}
       ${renderMappingFileChip('Teacher Mapping', masterData.teacherMappings.length, masterData.mappingFiles?.teacherMappings)}
+      ${renderMappingFileChip(`${performanceType} Upload`, performanceRows, masterData.mappingFiles?.performanceMarks)}
       <span class="master-chip">Follow-Up Notes <strong>${Object.keys(masterData.followUps || {}).length}</strong></span>
     </div>
-    <div class="mapping-helper">Auto-load uses school-code Excel files in this folder. Upload only if you want to override for this session.</div>`;
+    <div class="mapping-helper">Auto-load uses school-code Excel files in this folder. Upload only if you want to override for this session. Real-performance uploads stay in memory for this browser session.</div>
+    ${renderPerformanceReport(masterData)}`;
   }
 
   sessionList.innerHTML = sessions.length ? sessions.map(session => {
@@ -2042,33 +2364,36 @@ function renderSubjects(cls){
   if(!sts.length){document.getElementById('d-subjects').innerHTML=nodata();return;}
   const {students: enrichedStudents} = buildEnrichedStudents(cls);
   const showTeacherDetail = !!subjectViewState[cls]?.showTeacherDetail;
+  const mode = getActivePerformanceMode(cls);
+  const modeLabel = getPerformanceModeLabel(cls, mode);
+  const {labels: buckets, getBucket} = getPerformanceBuckets(mode);
+  const chartLabel = mode === 'total' ? `Average ${modeLabel}` : `Average ${modeLabel} %`;
 
   const sm = {};
-  const buckets = ['<=40','41-50','51-60','61-70','71-80','81-90','91-94','95-100'];
-  function getBucket(m){
-    if(m<=40) return '<=40';
-    if(m<=50) return '41-50';
-    if(m<=60) return '51-60';
-    if(m<=70) return '61-70';
-    if(m<=80) return '71-80';
-    if(m<=90) return '81-90';
-    if(m<=94) return '91-94';
-    return '95-100';
-  }
-
-  sts.forEach(student => student.subjects.forEach(subject => {
-    if(!sm[subject.code]) sm[subject.code] = {code:subject.code, name:subject.name, marks:[], pass:0, n:0, abs:0, mb:{}};
+  enrichedStudents.forEach(student => student.subjects.forEach(subject => {
+    if(!sm[subject.code]) sm[subject.code] = {code:subject.code, name:subject.name, marks:[], compareValues:[], maxValues:[], points:[], pass:0, valid:0, abs:0, missing:0, mb:{}};
     const entry = sm[subject.code];
-    if(!subjectIsAbsent(subject)){
-      entry.marks.push(subject.marks);
-      entry.n++;
-      entry.mb[getBucket(subject.marks)] = (entry.mb[getBucket(subject.marks)] || 0) + 1;
-      if(subjectIsPass(subject)) entry.pass++;
-    } else {
+    if(subjectIsAbsent(subject)){
       entry.abs++;
+      return;
     }
+    const mark = getPerformanceMark(subject, mode);
+    const compareValue = getPerformanceCompareValue(subject, mode);
+    const maxValue = getPerformanceMax(subject, mode);
+    if(mark === null){
+      entry.missing++;
+      return;
+    }
+    entry.marks.push(mark);
+    if(compareValue !== null) entry.compareValues.push(compareValue);
+    if(maxValue !== null) entry.maxValues.push(maxValue);
+    entry.points.push({mark, compareValue, maxValue});
+    entry.valid++;
+    const bucket = getBucket(subject);
+    if(bucket) entry.mb[bucket] = (entry.mb[bucket] || 0) + 1;
+    if(isPerformancePass(subject, mode)) entry.pass++;
   }));
-  const subs = Object.values(sm).filter(subject => (subject.marks.length + subject.abs) > 0).sort((a,b) => avg(b.marks) - avg(a.marks));
+  const subs = Object.values(sm).filter(subject => (subject.valid + subject.abs + subject.missing) > 0).sort((a,b) => avg(b.compareValues) - avg(a.compareValues));
 
   const teacherDetails = {};
   enrichedStudents.forEach(student => {
@@ -2079,40 +2404,57 @@ function renderSubjects(cls){
         teacherDetails[subject.code][key] = {
           teacherName: subject.teacherName || 'Unmapped',
           section: student.section || 'UNMAPPED',
-          taught: 0,
           total: 0,
+          absent: 0,
+          missing: 0,
+          taught: 0,
           pass: 0,
           fail: 0,
-          absent: 0,
           marks: [],
+          compareValues: [],
+          maxValues: [],
+          points: [],
           mb: {},
         };
       }
       const row = teacherDetails[subject.code][key];
       row.total += 1;
-      if(subjectIsAbsent(subject)) row.absent += 1;
-      else {
-        row.taught += 1;
-        row.marks.push(subject.marks);
-        if(subjectIsFail(subject)) row.fail += 1;
-        else row.pass += 1;
-        row.mb[getBucket(subject.marks)] = (row.mb[getBucket(subject.marks)] || 0) + 1;
+      if(subjectIsAbsent(subject)){
+        row.absent += 1;
+        return;
       }
+      const mark = getPerformanceMark(subject, mode);
+      const compareValue = getPerformanceCompareValue(subject, mode);
+      const maxValue = getPerformanceMax(subject, mode);
+      if(mark === null){
+        row.missing += 1;
+        return;
+      }
+      row.taught += 1;
+      row.marks.push(mark);
+      if(compareValue !== null) row.compareValues.push(compareValue);
+      if(maxValue !== null) row.maxValues.push(maxValue);
+      row.points.push({mark, compareValue, maxValue});
+      if(isPerformancePass(subject, mode)) row.pass += 1;
+      else row.fail += 1;
+      const bucket = getBucket(subject);
+      if(bucket) row.mb[bucket] = (row.mb[bucket] || 0) + 1;
     });
   });
 
   document.getElementById('d-subjects').innerHTML = `
     <div class="sec-h">
       <div class="sec-title">Subject Performance - Class ${cls}</div>
-      <div class="sec-sub">Average marks, highest score and pass % per subject · ${sts.length} students</div>
+      <div class="sec-sub">Average marks, highest score and threshold % per subject · ${sts.length} students</div>
     </div>
+    ${renderPerformanceControls(cls)}
     <div class="card">
-      <div class="card-title">Average Marks by Subject - Class ${cls}</div>
+      <div class="card-title">Average ${modeLabel} by Subject - Class ${cls}</div>
       <div class="cwrap-lg"><canvas id="c-subavg-${cls}"></canvas></div>
     </div>
     <div class="card" style="max-width:100%;overflow-x:auto;">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px">
-        <div class="card-title" style="margin-bottom:0">Detailed Marks Breakdown Table - Class ${cls}</div>
+        <div class="card-title" style="margin-bottom:0">Detailed ${modeLabel} Breakdown Table - Class ${cls}</div>
         <button class="btn-restore-json workspace-btn" onclick="toggleSubjectTeacherDetail('${cls}')" style="display:inline-block;padding:8px 14px">
           ${showTeacherDetail ? 'Hide Teacher Detail' : 'Show Teacher Detail'}
         </button>
@@ -2125,10 +2467,12 @@ function renderSubjects(cls){
               <th rowspan="2" style="white-space:nowrap">Code</th>
               <th rowspan="2" style="white-space:nowrap">TOTAL</th>
               <th rowspan="2" style="white-space:nowrap">ABS</th>
+              <th rowspan="2" style="white-space:nowrap">NA</th>
               <th rowspan="2" style="white-space:nowrap">APP</th>
-              <th rowspan="2" style="white-space:nowrap">"E"(FAIL)</th>
-              <th rowspan="2" style="white-space:nowrap">PASS</th>
-              <th rowspan="2" style="white-space:nowrap">PASS%</th>
+              <th rowspan="2" style="white-space:nowrap">${getPerformanceLowLabel(mode)}</th>
+              <th rowspan="2" style="white-space:nowrap">AT/ABOVE THRESHOLD</th>
+              <th rowspan="2" style="white-space:nowrap">THRESHOLD%</th>
+              <th rowspan="2" style="white-space:nowrap">OUT OF</th>
               <th rowspan="2" style="white-space:nowrap">AVG</th>
               <th rowspan="2" style="white-space:nowrap">MAX</th>
               <th rowspan="2" style="white-space:nowrap">MIN</th>
@@ -2137,19 +2481,20 @@ function renderSubjects(cls){
             <tr>${buckets.map(bucket => `<th style="white-space:nowrap;font-size:11px;text-align:center;padding:4px 6px">${bucket}</th>`).join('')}</tr>
           </thead>
           <tbody>${subs.map(subject => {
-            const total = subject.n + subject.abs;
-            const avgMarks = subject.n ? avg(subject.marks).toFixed(1) : '0.0';
-            const maxMarks = subject.n ? Math.max(...subject.marks) : 0;
-            const minMarks = subject.n ? Math.min(...subject.marks) : 0;
-            const fail = subject.n - subject.pass;
-            const passPct = subject.n ? pct(subject.pass, subject.n) : '0.0';
+            const total = subject.valid + subject.abs + subject.missing;
+            const avgMarks = formatPerformanceValue(subject.compareValues, mode, 'avg');
+            const maxMarks = formatPerformanceExtreme(subject.points, mode, 'max');
+            const minMarks = formatPerformanceExtreme(subject.points, mode, 'min');
+            const outOf = getPerformanceOutOfLabel(subject.maxValues, mode);
+            const fail = subject.valid - subject.pass;
+            const passPct = subject.valid ? pct(subject.pass, subject.valid) : '0.0';
             const ppColor = parseFloat(passPct) >= 90 ? 'var(--green)' : parseFloat(passPct) >= 75 ? '#1a7a8a' : parseFloat(passPct) >= 50 ? 'var(--amber)' : 'var(--red)';
             const detailRows = Object.values(teacherDetails[subject.code] || {}).sort((a,b) => a.teacherName.localeCompare(b.teacherName) || a.section.localeCompare(b.section));
             const rowHighlight = showTeacherDetail && detailRows.length
               ? 'background:#fdf1cc;border-top:2px solid #dfbf73;border-bottom:2px solid #dfbf73;'
               : '';
             const detailHtml = showTeacherDetail && detailRows.length ? `<tr>
-              <td colspan="${11 + buckets.length}" style="padding:0;background:#fbf8f3">
+              <td colspan="${13 + buckets.length}" style="padding:0;background:#fbf8f3">
                 <div style="padding:12px 16px">
                   <div style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:#9a8f82;margin-bottom:8px">Teacher-Level Detail</div>
                   <table style="width:100%">
@@ -2159,10 +2504,12 @@ function renderSubjects(cls){
                         <th style="text-align:left">Section</th>
                         <th style="text-align:center">TOTAL</th>
                         <th style="text-align:center">ABS</th>
+                        <th style="text-align:center">NA</th>
                         <th style="text-align:center">APP</th>
-                        <th style="text-align:center">Pass</th>
-                        <th style="text-align:center">"E"</th>
-                        <th style="text-align:center">Pass %</th>
+                        <th style="text-align:center">At/Above Threshold</th>
+                        <th style="text-align:center">${getPerformanceLowLabel(mode)}</th>
+                        <th style="text-align:center">Threshold %</th>
+                        <th style="text-align:center">Out Of</th>
                         <th style="text-align:center">Avg</th>
                         <th style="text-align:center">Max</th>
                         <th style="text-align:center">Min</th>
@@ -2171,19 +2518,22 @@ function renderSubjects(cls){
                     </thead>
                     <tbody>
                       ${detailRows.map(row => {
-                        const rowAvg = row.marks.length ? avg(row.marks).toFixed(1) : '0.0';
-                        const rowMax = row.marks.length ? Math.max(...row.marks) : 0;
-                        const rowMin = row.marks.length ? Math.min(...row.marks) : 0;
+                        const rowAvg = formatPerformanceValue(row.compareValues, mode, 'avg');
+                        const rowMax = formatPerformanceExtreme(row.points, mode, 'max');
+                        const rowMin = formatPerformanceExtreme(row.points, mode, 'min');
+                        const rowOutOf = getPerformanceOutOfLabel(row.maxValues, mode);
                         const rowPassPct = row.taught ? ((row.pass / row.taught) * 100).toFixed(1) : '0.0';
                         return `<tr>
                           <td><strong>${row.teacherName}</strong></td>
                           <td>${row.section}</td>
                           <td style="text-align:center">${row.total}</td>
                           <td style="text-align:center">${row.absent}</td>
+                          <td style="text-align:center">${row.missing}</td>
                           <td style="text-align:center">${row.taught}</td>
                           <td style="text-align:center;color:var(--green);font-weight:700">${row.pass}</td>
                           <td style="text-align:center;color:var(--red)">${row.fail}</td>
                           <td style="text-align:center;font-family:'DM Mono',monospace">${rowPassPct}%</td>
+                          <td style="text-align:center;font-family:'DM Mono',monospace">${rowOutOf}</td>
                           <td style="text-align:center;font-family:'DM Mono',monospace">${rowAvg}</td>
                           <td style="text-align:center;font-family:'DM Mono',monospace">${rowMax}</td>
                           <td style="text-align:center;font-family:'DM Mono',monospace">${rowMin}</td>
@@ -2203,10 +2553,12 @@ function renderSubjects(cls){
               <td style="font-family:'DM Mono',monospace;color:#bbb;font-size:12px;text-align:center;${rowHighlight}">${subject.code}</td>
               <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${total}</td>
               <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${subject.abs}</td>
-              <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${subject.n}</td>
+              <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${subject.missing}</td>
+              <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${subject.valid}</td>
               <td style="font-family:'DM Mono',monospace;text-align:center;color:var(--red);${rowHighlight}">${fail}</td>
               <td style="font-family:'DM Mono',monospace;text-align:center;color:var(--green);font-weight:700;${rowHighlight}">${subject.pass}</td>
               <td style="font-family:'DM Mono',monospace;font-weight:700;text-align:center;color:${ppColor};${rowHighlight}">${passPct}%</td>
+              <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${outOf}</td>
               <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${avgMarks}</td>
               <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${maxMarks}</td>
               <td style="font-family:'DM Mono',monospace;text-align:center;${rowHighlight}">${minMarks}</td>
@@ -2228,7 +2580,7 @@ function renderSubjects(cls){
   charts['c-subavg-'+cls] = new Chart(document.getElementById('c-subavg-'+cls),{
     type:'bar',
     data:{labels:top.map(subject => subject.name.length > 22 ? subject.name.slice(0,20) + '...' : subject.name),
-      datasets:[{label:'Avg Marks',data:top.map(subject => parseFloat(avg(subject.marks).toFixed(1))),
+      datasets:[{label:chartLabel,data:top.map(subject => parseFloat(avg(subject.compareValues).toFixed(1)) || 0),
         backgroundColor:top.map((_,i)=>CC[cls].bar(i)),borderRadius:4}]},
     options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
       scales:{x:{ticks:{font:{family:'DM Mono'}},grid:{color:'#f0ede8'}},
@@ -2725,6 +3077,7 @@ const sortState  = {};
 // current filtered+sorted pool per class — used by exportCurrentView
 const currentPool = {};
 const subjectViewState = {};
+const performanceViewState = {X:'total', XII:'total'};
 
 function drawStudents(cls){
   const resF = document.getElementById('stf-res-'+cls)?.value || 'all';
@@ -2844,6 +3197,174 @@ function toggleSubjectTeacherDetail(cls){
     showTeacherDetail: !subjectViewState[cls]?.showTeacherDetail
   };
   renderSubjects(cls);
+}
+
+function getPerformanceModeOptions(cls){
+  const session = getCurrentSingleSession();
+  const componentType = session?.masterData?.performanceMarks?.componentType || null;
+  const options = [{value:'total', label:'Total Marks'}];
+  if(componentType){
+    options.push({value:'theory', label:'Theory Marks'});
+    options.push({value:'component', label: componentType === 'practical' ? 'Practical Marks' : 'Internal Marks'});
+  }
+  return options;
+}
+
+function getActivePerformanceMode(cls){
+  const options = getPerformanceModeOptions(cls);
+  const current = performanceViewState[cls] || 'total';
+  if(options.some(option => option.value === current)) return current;
+  performanceViewState[cls] = 'total';
+  return 'total';
+}
+
+function setPerformanceAnalysisMode(cls, mode){
+  performanceViewState[cls] = mode;
+  if(activeSec === 'subjects') renderSubjects(cls);
+  if(activeSec === 'teachers') renderTeacherReview(cls);
+}
+
+function getPerformanceModeLabel(cls, mode){
+  return (getPerformanceModeOptions(cls).find(option => option.value === mode) || {}).label || 'Total Marks';
+}
+
+function getPerformanceMark(subject, mode){
+  if(mode === 'theory') return Number.isFinite(subject.theoryMarks) ? subject.theoryMarks : null;
+  if(mode === 'component') return Number.isFinite(subject.componentMarks) ? subject.componentMarks : null;
+  return Number.isFinite(subject.marks) ? subject.marks : null;
+}
+
+function getPerformanceMax(subject, mode){
+  if(mode === 'theory') return Number.isFinite(subject.theoryMaxMarks) ? subject.theoryMaxMarks : null;
+  if(mode === 'component') return Number.isFinite(subject.componentMaxMarks) ? subject.componentMaxMarks : null;
+  return 100;
+}
+
+function getPerformancePct(subject, mode){
+  const mark = getPerformanceMark(subject, mode);
+  const max = getPerformanceMax(subject, mode);
+  if(mark === null || !max) return null;
+  return (mark / max) * 100;
+}
+
+function getPerformanceCompareValue(subject, mode){
+  return mode === 'total' ? getPerformanceMark(subject, mode) : getPerformancePct(subject, mode);
+}
+
+function isPerformanceMissing(subject, mode){
+  return !subjectIsAbsent(subject) && getPerformanceMark(subject, mode) === null;
+}
+
+function getPerformanceThreshold(subject, mode){
+  if(mode === 'total') return 33;
+  return 33;
+}
+
+function isPerformancePass(subject, mode){
+  if(subjectIsAbsent(subject)) return false;
+  const value = getPerformanceCompareValue(subject, mode);
+  const threshold = getPerformanceThreshold(subject, mode);
+  if(value === null || threshold === null) return false;
+  return value >= threshold;
+}
+
+function isPerformanceDistinction(subject, mode){
+  if(subjectIsAbsent(subject)) return false;
+  if(mode === 'total'){
+    const mark = getPerformanceMark(subject, mode);
+    return mark !== null && mark >= 90;
+  }
+  const pctValue = getPerformancePct(subject, mode);
+  return pctValue !== null && pctValue >= 90;
+}
+
+function getPerformanceLowLabel(mode){
+  return mode === 'total' ? 'Below 33' : 'Below 33%';
+}
+
+function getPerformanceDistinctionLabel(mode){
+  return mode === 'total' ? '90+' : '90%+';
+}
+
+function getPerformanceBuckets(mode){
+  const labels = mode === 'total'
+    ? ['<=40','41-50','51-60','61-70','71-80','81-90','91-94','95-100']
+    : ['<=40%','41-50%','51-60%','61-70%','71-80%','81-90%','91-94%','95-100%'];
+  return {
+    labels,
+    getBucket(subject){
+      const value = mode === 'total' ? getPerformanceMark(subject, mode) : getPerformancePct(subject, mode);
+      if(value === null) return null;
+      if(value <= 40) return labels[0];
+      if(value <= 50) return labels[1];
+      if(value <= 60) return labels[2];
+      if(value <= 70) return labels[3];
+      if(value <= 80) return labels[4];
+      if(value <= 90) return labels[5];
+      if(value <= 94) return labels[6];
+      return labels[7];
+    }
+  };
+}
+
+function getPerformanceOutOfLabel(maxValues, mode){
+  if(mode === 'total') return '100';
+  const values = (maxValues || []).filter(value => Number.isFinite(value));
+  if(!values.length) return 'NA';
+  const unique = [...new Set(values.map(value => Number(value.toFixed(2))))];
+  if(unique.length === 1){
+    const only = unique[0];
+    return Number.isInteger(only) ? String(only) : only.toFixed(2);
+  }
+  return 'Mixed';
+}
+
+function formatPerformanceValue(values, mode, type){
+  if(!values.length) return 'NA';
+  const numeric = type === 'max'
+    ? Math.max(...values)
+    : type === 'min'
+      ? Math.min(...values)
+      : avg(values);
+  return mode === 'total'
+    ? numeric.toFixed(1).replace(/\.0$/, '')
+    : `${numeric.toFixed(1)}%`;
+}
+
+function formatPerformanceExtreme(points, mode, type){
+  if(!points.length) return 'NA';
+  const compareValues = points.map(point => point.compareValue).filter(value => Number.isFinite(value));
+  if(!compareValues.length) return 'NA';
+  const target = type === 'max' ? Math.max(...compareValues) : Math.min(...compareValues);
+  const matches = points.filter(point => Number.isFinite(point.compareValue) && Math.abs(point.compareValue - target) < 1e-9);
+  if(mode === 'total'){
+    return matches.length > 1 ? `${target.toFixed(1).replace(/\.0$/, '')} (${matches.length})` : target.toFixed(1).replace(/\.0$/, '');
+  }
+  const actuals = [...new Set(matches.map(point => `${point.mark}/${point.maxValue}`))];
+  const countText = matches.length > 1 ? ` x${matches.length}` : '';
+  return `<div>${target.toFixed(1)}%</div><div class="metric-sub">${actuals.join(', ')}${countText}</div>`;
+}
+
+function renderPerformanceControls(cls){
+  const mode = getActivePerformanceMode(cls);
+  const options = getPerformanceModeOptions(cls);
+  const session = getCurrentSingleSession();
+  const diagnostics = session?.masterData?.diagnostics?.performanceMarks || createEmptyMasterData().diagnostics.performanceMarks;
+  const componentLabel = session?.masterData?.performanceMarks?.componentType === 'practical' ? 'Practical' : 'Internal';
+  const scopeLabel = diagnostics.scopedClasses?.length ? diagnostics.scopedClasses.join(', ') : 'uploaded classes';
+  const helper = options.length === 1
+    ? 'Upload an Internal or Practical workbook to unlock theory-based review.'
+    : `${componentLabel} rows: ${diagnostics.rows} | Scope: ${scopeLabel} | Uploaded matched: ${diagnostics.matched} | Duplicate upload rows: ${diagnostics.duplicateRows} | Upload unmatched: ${diagnostics.unmatched} | Expected subject rows missing upload: ${diagnostics.missingCoverage} | Derived theory: ${diagnostics.derivedTheory} | Theory max = 100 - uploaded max`;
+  return `
+    <div class="review-controls">
+      <div class="review-field">
+        <label>Analysis Mode</label>
+        <select class="followup-input small" onchange="setPerformanceAnalysisMode('${cls}', this.value)">
+          ${options.map(option => `<option value="${option.value}" ${option.value === mode ? 'selected' : ''}>${option.label}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div class="review-note">Analysis mode: ${getPerformanceModeLabel(cls, mode)}. ${helper}</div>`;
 }
 
 function getSortIndicator(key, col){
@@ -2973,6 +3494,11 @@ function renderTeacherReview(cls){
     target.innerHTML = nodata();
     return;
   }
+  const mode = getActivePerformanceMode(cls);
+  const modeLabel = getPerformanceModeLabel(cls, mode);
+  const avgHeader = mode === 'total' ? 'Avg' : 'Avg %';
+  const schoolAvgHeader = mode === 'total' ? 'School Avg' : 'School Avg %';
+  const varianceHeader = mode === 'total' ? 'Variance' : 'Variance pp';
 
   const groups = {};
   students.forEach(student => {
@@ -2985,22 +3511,34 @@ function renderTeacherReview(cls){
           subjectCode: subject.code,
           subjectName: subject.mappedSubjectName || subject.name,
           section: student.section,
-          students: [],
+          totalStudents: 0,
           marks: [],
+          compareValues: [],
+          maxValues: [],
           passCount: 0,
           absentCount: 0,
           distinctionCount: 0,
           lowCount: 0,
+          missingCount: 0,
         };
       }
       const group = groups[key];
-      group.students.push(student.rollNo);
+      group.totalStudents += 1;
       if(subject.grade === 'AB') group.absentCount += 1;
       else {
-        group.marks.push(subject.marks);
-        if(subject.grade !== 'E' && subject.marks >= 33) group.passCount += 1;
-        if(subject.marks >= 90) group.distinctionCount += 1;
-        if(subject.marks < 33) group.lowCount += 1;
+        const mark = getPerformanceMark(subject, mode);
+        const compareValue = getPerformanceCompareValue(subject, mode);
+        const maxValue = getPerformanceMax(subject, mode);
+        if(mark === null){
+          group.missingCount += 1;
+          return;
+        }
+        group.marks.push(mark);
+        if(compareValue !== null) group.compareValues.push(compareValue);
+        if(maxValue !== null) group.maxValues.push(maxValue);
+        if(isPerformancePass(subject, mode)) group.passCount += 1;
+        if(isPerformanceDistinction(subject, mode)) group.distinctionCount += 1;
+        if(!isPerformancePass(subject, mode)) group.lowCount += 1;
       }
     });
   });
@@ -3009,14 +3547,15 @@ function renderTeacherReview(cls){
   students.forEach(student => {
     student.subjects.forEach(subject => {
       schoolSubjectAverages[subject.code] = schoolSubjectAverages[subject.code] || [];
-      if(subject.grade !== 'AB') schoolSubjectAverages[subject.code].push(subject.marks);
+      const compareValue = getPerformanceCompareValue(subject, mode);
+      if(subject.grade !== 'AB' && compareValue !== null) schoolSubjectAverages[subject.code].push(compareValue);
     });
   });
 
   let rows = Object.values(groups).map(group => {
-    const taught = group.students.length;
+    const taught = group.compareValues.length;
     const schoolAvg = avg(schoolSubjectAverages[group.subjectCode] || []);
-    const teacherAvg = avg(group.marks);
+    const teacherAvg = avg(group.compareValues);
     return {
       ...group,
       taught,
@@ -3024,6 +3563,7 @@ function renderTeacherReview(cls){
       avgMarks: teacherAvg.toFixed(1),
       schoolAvg: schoolAvg.toFixed(1),
       variance: (teacherAvg - schoolAvg).toFixed(1),
+      outOf: getPerformanceOutOfLabel(group.maxValues, mode),
     };
   });
   const sortKey = `teacher-review-${cls}`;
@@ -3041,6 +3581,7 @@ function renderTeacherReview(cls){
       variance: parseFloat(a.variance),
       distinctionCount: a.distinctionCount,
       lowCount: a.lowCount,
+      missingCount: a.missingCount,
       absentCount: a.absentCount,
     }[teacherSort.col];
     const valueB = {
@@ -3055,6 +3596,7 @@ function renderTeacherReview(cls){
       variance: parseFloat(b.variance),
       distinctionCount: b.distinctionCount,
       lowCount: b.lowCount,
+      missingCount: b.missingCount,
       absentCount: b.absentCount,
     }[teacherSort.col];
     if(typeof valueA === 'number' && typeof valueB === 'number') return teacherSort.dir * (valueA - valueB);
@@ -3066,13 +3608,14 @@ function renderTeacherReview(cls){
       <div class="sec-title">Teacher Review - Class ${cls}</div>
       <div class="sec-sub">Same-class board-result review by mapped subject teacher and section.</div>
     </div>
+    ${renderPerformanceControls(cls)}
     <div class="review-note">
-      Teacher mapping rows: ${diagnostics.teacherMappings.rows} | Mapped subject rows: ${diagnostics.teacherMappings.matched} | Unmapped subject rows: ${diagnostics.teacherMappings.unmapped}
+      Teacher mapping rows: ${diagnostics.teacherMappings.rows} | Mapped subject rows: ${diagnostics.teacherMappings.matched} | Unmapped subject rows: ${diagnostics.teacherMappings.unmapped} | View: ${modeLabel}
     </div>
     <div class="card">
       <div class="tbl-wrap">
         <table>
-          <thead><tr><th>${sortHeader(sortKey,'teacherName','Teacher')}</th><th>${sortHeader(sortKey,'department','Department')}</th><th>${sortHeader(sortKey,'subjectName','Subject')}</th><th>${sortHeader(sortKey,'section','Section')}</th><th>${sortHeader(sortKey,'taught','Taught')}</th><th>${sortHeader(sortKey,'passPct','Pass %')}</th><th>${sortHeader(sortKey,'avgMarks','Avg')}</th><th>${sortHeader(sortKey,'schoolAvg','School Avg')}</th><th>${sortHeader(sortKey,'variance','Variance')}</th><th>${sortHeader(sortKey,'distinctionCount','90+')}</th><th>${sortHeader(sortKey,'lowCount','Below 33')}</th><th>${sortHeader(sortKey,'absentCount','Absent')}</th></tr></thead>
+          <thead><tr><th>${sortHeader(sortKey,'teacherName','Teacher')}</th><th>${sortHeader(sortKey,'department','Department')}</th><th>${sortHeader(sortKey,'subjectName','Subject')}</th><th>${sortHeader(sortKey,'section','Section')}</th><th>${sortHeader(sortKey,'taught','Taught')}</th><th>${sortHeader(sortKey,'passPct','Threshold %')}</th><th>Out Of</th><th>${sortHeader(sortKey,'avgMarks',avgHeader)}</th><th>${sortHeader(sortKey,'schoolAvg',schoolAvgHeader)}</th><th>${sortHeader(sortKey,'variance',varianceHeader)}</th><th>${sortHeader(sortKey,'distinctionCount',getPerformanceDistinctionLabel(mode))}</th><th>${sortHeader(sortKey,'lowCount',getPerformanceLowLabel(mode))}</th><th>${sortHeader(sortKey,'missingCount','NA')}</th><th>${sortHeader(sortKey,'absentCount','Absent')}</th></tr></thead>
           <tbody>
             ${rows.map(row => `
               <tr>
@@ -3082,11 +3625,13 @@ function renderTeacherReview(cls){
                 <td>${row.section}</td>
                 <td>${row.taught}</td>
                 <td style="font-family:'DM Mono',monospace;font-weight:700;color:var(--green)">${row.passPct}%</td>
-                <td>${row.avgMarks}</td>
-                <td>${row.schoolAvg}</td>
+                <td style="font-family:'DM Mono',monospace">${row.outOf}</td>
+                <td>${mode === 'total' ? row.avgMarks : `${row.avgMarks}%`}</td>
+                <td>${mode === 'total' ? row.schoolAvg : `${row.schoolAvg}%`}</td>
                 <td style="font-family:'DM Mono',monospace">${row.variance}</td>
                 <td>${row.distinctionCount}</td>
                 <td>${row.lowCount}</td>
+                <td>${row.missingCount}</td>
                 <td>${row.absentCount}</td>
               </tr>
             `).join('')}

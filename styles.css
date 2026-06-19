@@ -646,6 +646,78 @@ header {
   font-size:12px;
   color:#8b7c67;
 }
+.performance-report {
+  margin-top:12px;
+  border:1px solid #eadfce;
+  border-radius:16px;
+  background:#fffdfa;
+  overflow:hidden;
+}
+.performance-report summary {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding:12px 14px;
+  cursor:pointer;
+  font-size:13px;
+  font-weight:800;
+  color:#735e4a;
+  list-style:none;
+}
+.performance-report summary::-webkit-details-marker {
+  display:none;
+}
+.performance-report summary span {
+  font-size:12px;
+  font-weight:700;
+  color:#8b7c67;
+}
+.performance-report-table {
+  max-height:360px;
+  border-top:1px solid #f0e6d8;
+}
+.report-status {
+  display:inline-flex;
+  align-items:center;
+  padding:4px 8px;
+  border-radius:999px;
+  font-size:11px;
+  font-weight:800;
+  letter-spacing:.04em;
+  text-transform:uppercase;
+}
+.report-status.ok {
+  background:#eaf7ef;
+  color:#157347;
+}
+.report-status.miss {
+  background:#fff0ef;
+  color:#bb3e2f;
+}
+.workspace-inline-field {
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  min-width:180px;
+}
+.workspace-inline-field label {
+  font-size:11px;
+  font-weight:800;
+  text-transform:uppercase;
+  letter-spacing:.08em;
+  color:#999;
+}
+.workspace-select {
+  min-height:42px;
+  padding:10px 12px;
+  border-radius:999px;
+  border:1px solid #d8c4a5;
+  background:#fff;
+  color:#7b4f17;
+  font:inherit;
+  font-weight:700;
+}
 .review-note {
   margin-bottom:14px;
   padding:12px 14px;
@@ -670,6 +742,13 @@ header {
   text-transform:uppercase;
   letter-spacing:.08em;
   color:#999;
+}
+.metric-sub {
+  margin-top:2px;
+  font-size:11px;
+  color:#8b7c67;
+  line-height:1.2;
+  white-space:nowrap;
 }
 .followup-input {
   width:100%;
